@@ -1,0 +1,48 @@
+# --- Python / Poetry ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+*.egg
+.env
+.venv/
+poetry.lock
+.idea/
+.vscode/
+.DS_Store
+
+# --- Notebooks / logs ---
+*.ipynb_checkpoints
+logs/
+*.log
+
+# --- Cache / Hugging Face / Transformers ---
+.cache/
+~/.cache/
+huggingface/
+~/.huggingface/
+transformers_cache/
+datasets/
+*.safetensors
+*.bin
+*.pt
+
+# --- Outputs ---
+data/ocr_text/
+data/predictions/
+*.jsonl
+*.txt
+*.out
+*.tar
+*.gz
+
+# --- Raw data (too heavy for git) ---
+data/raw_pdf/
+
+# --- Temp / OS ---
+Thumbs.db
+.DS_Store
+*.swp
+*.tmp

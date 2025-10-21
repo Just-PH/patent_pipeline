@@ -1,0 +1,25 @@
+[project]
+name = "patent-pipeline"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "ph delville",email = "phdelville33@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "transformers (>=4.57.1,<5.0.0)",
+    "pydantic (>=2.12.3,<3.0.0)",
+    "pillow (>=12.0.0,<13.0.0)",
+    "pytesseract (>=0.3.13,<0.4.0)",
+    "pdf2image (>=1.17.0,<2.0.0)",
+    "opencv-python (>=4.12.0.88,<5.0.0.0)",
+    "tqdm (>=4.67.1,<5.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "patent_pipeline", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
