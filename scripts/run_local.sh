@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export DEVICE=${DEVICE:-mps}     # mps par défaut sur Mac
-export HF_MODEL=${HF_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
+
+export DEVICE=${DEVICE:-mps}    # mps par défaut sur Mac
+export HF_MODEL="mlx-community/Mistral-7B-Instruct-v0.3"
+
 poetry run python -m patent_pipeline
