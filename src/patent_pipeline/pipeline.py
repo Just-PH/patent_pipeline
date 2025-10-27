@@ -11,8 +11,6 @@ PRED_DIR = Path("data/predictions")
 REPORT_FILE = Path("data/ocr_report.csv")
 
 def run_pipeline():
-    print_device_info()
-    print(os.getenv('HF_MODEL'))
     OCR_DIR.mkdir(parents=True, exist_ok=True)
     PRED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -23,11 +21,13 @@ def run_pipeline():
         report_file=REPORT_FILE,
         country_hint="ch",
         force=False,
-        threads=4
+        threads=4,
+        backend='doctr',
+        limit = None
     )
 
     # 2️⃣ Extraction LLM
-    batch_extract_features(OCR_DIR, PRED_DIR / "predictions_all.jsonl",limit=1)
+    batch_extract_features(OCR_DIR, PRED_DIR / "predictions_all.jsonl",limit=None)
 
 
 if __name__ == "__main__":

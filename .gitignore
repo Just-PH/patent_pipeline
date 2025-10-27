@@ -31,8 +31,6 @@ datasets/
 
 # --- Outputs ---
 data/ocr_text/
-data/predictions/
-*.jsonl
 *.txt
 *.out
 *.tar

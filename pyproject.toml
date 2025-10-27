@@ -23,7 +23,9 @@ dependencies = [
     "accelerate (>=1.11.0,<2.0.0)",
     "regexp (>=0.1,<0.2)",
     "mlx-lm (>=0.28.3,<0.29.0)",
-    "sentencepiece (>=0.2.1,<0.3.0)"
+    "sentencepiece (>=0.2.1,<0.3.0)",
+    "python-doctr[torch] (>=1.0.0,<2.0.0)",
+    "opencv-python-headless (>=4.12.0.88,<5.0.0.0)",
 ]
 
 [tool.poetry]
@@ -32,3 +34,8 @@ packages = [{include = "patent_pipeline", from = "src"}]
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "ipykernel (>=7.0.1,<8.0.0)"
+]
