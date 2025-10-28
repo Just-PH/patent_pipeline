@@ -26,6 +26,7 @@ dependencies = [
     "sentencepiece (>=0.2.1,<0.3.0)",
     "python-doctr[torch] (>=1.0.0,<2.0.0)",
     "opencv-python-headless (>=4.12.0.88,<5.0.0.0)",
+    "easyocr (>=1.7.2,<2.0.0)",
 ]
 
 [tool.poetry]

@@ -38,6 +38,8 @@ data/ocr_text/
 
 # --- Raw data (too heavy for git) ---
 data/raw_pdf/
+data/gold_standard_DE/
+
 
 # --- Temp / OS ---
 Thumbs.db
