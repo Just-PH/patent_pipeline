@@ -17,11 +17,7 @@ REPORT_FILE = Path("data/ocr_report.csv")
 # OCR_DIR = Path("data/gold_standard_DE/ocr_text")
 # PRED_DIR = Path("data/gold_standard_DE/predictions")
 # REPORT_FILE = Path("data/gold_standard_DE/ocr_report.csv")
-# 📄 src/patent_pipeline/pipeline.py
 
-# ----------------------------------------------------------------------
-# 🚀 Pipeline principal
-# ----------------------------------------------------------------------
 # ----------------------------------------------------------------------
 # 🚀 Pipeline principale
 # ----------------------------------------------------------------------
@@ -30,9 +26,9 @@ def run_pipeline(
     out_dir: Path = OCR_DIR,
     report_file: Path = REPORT_FILE,
     pred_dir: Path = PRED_DIR,
-    backend: str = "doctr",
+    backend: str = "tesseract",
     batch_size: int = 4,
-    limit: int = 100,
+    limit: int = None,
     force: bool = True,
     country_hint: str = "ch",
 ):
@@ -52,6 +48,7 @@ def run_pipeline(
         backend=backend,
         batch_size=batch_size,
         limit=limit,
+        threads=4
     )
 
     # 2️⃣ Extraction LLM
@@ -72,7 +69,8 @@ if __name__ == "__main__":
     parser.add_argument("--report_file", type=Path, default=REPORT_FILE)
     parser.add_argument("--backend", type=str, default="doctr")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--country_hint", type=str, default="ch")
 

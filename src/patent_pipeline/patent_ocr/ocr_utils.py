@@ -12,6 +12,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from typing import Optional, Tuple
 from io import BytesIO
+from collections import Counter
+
+# 📚 Fréquences moyennes par langue (sources combinées : Norvig, Lewand, Lexique3)
+REF_FREQ = {
+    "fr": {"e":14.7, "a":8.4, "i":7.5, "s":7.9, "t":7.2, "r":6.5, "n":7.0, "c":3.3, "o":5.2, "u":6.3},
+    "de": {"e":17.4, "a":6.5, "i":7.6, "s":7.3, "t":6.2, "r":7.0, "n":9.8, "c":3.1, "o":2.5, "u":4.0},
+    "en": {"e":12.7, "a":8.2, "i":6.9, "s":6.3, "t":9.1, "r":6.0, "n":6.7, "c":2.8, "o":7.5, "u":2.3},
+    "it": {"e":11.8, "a":11.5, "i":10.1, "s":4.9, "t":5.6, "r":6.4, "n":6.8, "c":4.5, "o":9.8, "u":3.2},
+    "mix": {"e":14.0, "a":8.0, "i":7.0, "s":7.0, "t":7.0, "r":6.5, "n":7.5, "c":3.5, "o":6.0, "u":4.5},
+}
 
 TESSERACT_LANGS = "frk+deu+eng+fra+ita"
 
@@ -59,13 +69,48 @@ def autocrop_image(pil_img, threshold=245):
     cropped = pil_img.crop((x0, y0, x1, y1))
     return cropped
 
-def preprocess_image(img):
-    img = deskew_image(img)
-    img = ImageOps.grayscale(img)
-    img = ImageOps.autocontrast(img)
-    img = img.point(lambda x: 0 if x < 140 else 255, "1")
-    img = autocrop_image(img, threshold=245)
-    return img
+def clahe(gray, clip=2.0, grid=8):
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(grid, grid))
+    return clahe.apply(gray)
+
+def unsharp(gray, sigma=1.0, strength=0.6):
+    # léger (évite les halos qui ferment les boucles du “2”)
+    blur = cv2.GaussianBlur(gray, (0, 0), sigma)
+    return cv2.addWeighted(gray, 1 + strength, blur, -strength, 0)
+
+def otsu_with_bias(gray, bias=8):
+    # Otsu puis on relève un peu le seuil pour ne PAS boucher les ouvertures
+    t, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    t = max(0, min(255, t + bias))
+    _, bw = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY)
+    return bw
+
+def preprocess_image(pil_img):
+    # 0) légère montée d’échelle pour stabiliser les chiffres fins
+    up = pil_img.resize(
+        (int(pil_img.width * 1.5), int(pil_img.height * 1.5)),
+        Image.LANCZOS
+    )
+
+    # 1) deskew très léger AVANT tout (réutilise ta fonction)
+    up = deskew_image(up)
+
+    # 2) gris → CLAHE (local, mieux qu’equalizeHist pour éviter d’amplifier le bruit)
+    gray = np.array(up.convert("L"))
+    gray = clahe(gray, clip=2.0, grid=8)
+
+    # 3) unsharp léger (sigma 1.0, strength 0.6) : rend les bords nets sans halo
+    gray = unsharp(gray, sigma=1.0, strength=0.6)
+
+    # 4) binarisation douce : Otsu + petit biais vers le blanc
+    bw = otsu_with_bias(gray, bias=5)
+
+    # 5) sortie PIL + autocontrast + autocrop
+    pil_out = Image.fromarray(bw)
+    pil_out = ImageOps.autocontrast(pil_out)
+    pil_out = autocrop_image(pil_out, threshold=245)
+    return pil_out
+
 
 # ----------------------------------------------------------------------
 # 🌍 Helpers
@@ -85,7 +130,7 @@ def map_country(country_code: str) -> str:
     country_code = country_code.lower()
 
     mapping = {
-        "ch": "fra+deu+ita+eng",  # 🇨🇭 Suisse
+        "ch": "fra+deu+ita",  # 🇨🇭 Suisse
         "fr": "fra+eng",           # 🇫🇷 France
         "de": "frk+deu+eng",       # 🇩🇪 Allemagne
         "it": "ita+eng",           # 🇮🇹 Italie
@@ -150,7 +195,21 @@ def process_one_CPU(args):
         raise ValueError(f"Unknown CPU backend: {backend}")
 
     out_file.write_text(text, encoding="utf-8")
-    return {"file_name": doc.name, "status": "ok"}
+
+    # 💡 Compte uniquement les lettres pertinentes
+    key_letters = list("ecoagpnrvthkslyq")
+    text_lower = text.lower()
+    total_letters = sum(c.isalpha() for c in text_lower) or 1
+    cnt = Counter(c for c in text_lower if c in key_letters)
+    counts = {l: cnt.get(l, 0) / total_letters * 100 for l in key_letters}
+
+
+    # ✅ Retourne uniquement les champs connus
+    res = {"file_name": doc.name, "status": "ok"}
+    for l in key_letters:
+        res[f"freq_{l}"] = round(counts[l], 2)
+
+    return res
 
 
 def process_all_CPU(
@@ -163,14 +222,24 @@ def process_all_CPU(
     # 🧩 Prépare les arguments complets pour chaque worker
     args = [(doc, out_dir, backend, force, country_hint) for doc in docs]
 
+    # 🧠 Lettres les plus sensibles aux erreurs de boucle / fermeture
+    key_letters = list("ecoagpnrvthkslyq")
+
+    fieldnames = ["file_name", "status"] + [f"freq_{l}" for l in key_letters]
     # ---- Run multiprocessing ----
     with report_file.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["file_name", "status"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
         with ProcessPoolExecutor(max_workers=threads) as pool:
             for res in tqdm(pool.map(process_one_CPU, args), total=len(docs),
                             desc=f"🧩 OCR CPU ({backend})"):
+
+                # ✅ garde uniquement les champs prévus
+                filtered = {k: v for k, v in res.items() if k in fieldnames or not k.startswith("freq_")}
+                for l in key_letters:
+                    filtered.setdefault(f"freq_{l}", 0.0)
+
                 writer.writerow(res)
 
     elapsed = time.time() - start
@@ -214,9 +283,7 @@ def process_all_GPU(docs, out_dir, report_file,
 
     print(f"🚀 Using {backend.upper()} on {device} (batch={batch_size})")
 
-    # ------------------------------------------------------------------
     # 🧹 Filtrage des fichiers (skip existants si pas --force)
-    # ------------------------------------------------------------------
     todo = []
     skipped = []
     for p in docs:
@@ -228,14 +295,11 @@ def process_all_GPU(docs, out_dir, report_file,
 
     print(f"📂 {len(todo)} to process, {len(skipped)} skipped (existing files)")
 
-    # Rien à faire
     if not todo:
         print("🎉 Nothing to process, all files already OCR’d.")
         return
 
-    # ------------------------------------------------------------------
     # Backend = docTR
-    # ------------------------------------------------------------------
     if backend == "doctr":
         from doctr.io import DocumentFile
         from doctr.models import ocr_predictor
@@ -281,39 +345,6 @@ def process_all_GPU(docs, out_dir, report_file,
 
                 q.put(None)
 
-            # def consumer():
-            #     while True:
-            #         item = q.get()
-            #         if item is None:
-            #             break
-            #         if not isinstance(item, tuple) or len(item) != 2:
-            #             print(f"⚠️ Unexpected queue item: {type(item)} {item}")
-            #             continue
-
-            #         path_str, pil_img = item
-            #         if not isinstance(pil_img, Image.Image):
-            #             print(f"⚠️ Not a PIL image for {path_str}: {type(pil_img)}")
-            #             continue
-
-            #         p = Path(path_str)
-            #         out_txt = out_dir / f"{p.stem}.txt"
-            #         try:
-            #             # ⭐ In-memory PNG bytes → always supported by docTR
-            #             buf = BytesIO()
-            #             pil_img.save(buf, format="PNG")
-            #             image_bytes = buf.getvalue()
-
-            #             docfile = DocumentFile.from_images([image_bytes])  # list of file-like objects
-            #             result = predictor(docfile)
-
-            #             out_txt.write_text(result.render(), encoding="utf-8")
-            #             writer.writerow({"file_name": p.name, "status": "ok"})
-            #         except Exception as e:
-            #             print(f"❌ Error on {p.name}: {e}")
-            #             writer.writerow({"file_name": p.name, "status": "error"})
-            #         finally:
-            #             pbar_ocr.update(1)
-            #             gc.collect()
             def consumer(batch_size=4):
                 batch = []
                 metas = []
@@ -343,8 +374,6 @@ def process_all_GPU(docs, out_dir, report_file,
 
                     docfile = DocumentFile.from_images(bufs)
                     result = predictor(docfile)
-
-                    # Rendu : result.pages correspond à chaque image du batch
                     rendered = result.render()
                     if isinstance(rendered, list):
                         for meta, text in zip(metas, rendered):

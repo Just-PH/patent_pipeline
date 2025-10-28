@@ -1,7 +1,7 @@
 # 📄 src/patent_pipeline/pydantic/models.py
 from datetime import date, datetime
 from typing import Optional, List, Union
-from pydantic_extraction import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 # ---------------------------------------------------------------------
