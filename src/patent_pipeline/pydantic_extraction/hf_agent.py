@@ -227,7 +227,7 @@ def extract_features_from_txt(txt_path: Path) -> dict:
         }
 
 # -----------------------------------------------------------------------------
-def batch_extract_features(txt_dir: Path, out_file: Path, limit: int | None = None):
+def batch_extract_features(txt_dir: Path, out_file: Path, limit_llm: int | None = None):
     """
     Parcourt tous les .txt d'un dossier, lance extract_features_from_txt,
     et écrit les résultats dans un seul fichier JSONL.
@@ -235,9 +235,9 @@ def batch_extract_features(txt_dir: Path, out_file: Path, limit: int | None = No
     txt_files = sorted(txt_dir.glob("*.txt"))
     total = len(txt_files)
 
-    if limit is not None and limit < total:
-        txt_files = txt_files[:limit]
-        print(f"⚙️ Limiting extraction to {limit} documents (out of {total} total)")
+    if limit_llm is not None and limit_llm < total:
+        txt_files = txt_files[:limit_llm]
+        print(f"⚙️ Limiting extraction to {limit_llm} documents (out of {total} total)")
     else:
         print(f"⚙️ Processing all {total} documents")
 

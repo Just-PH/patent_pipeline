@@ -8,11 +8,11 @@ import cv2
 import pytesseract
 import regexp as re
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
-from typing import Optional, Tuple
 from io import BytesIO
 from collections import Counter
+from skimage import filters, img_as_ubyte
 
 # 📚 Fréquences moyennes par langue (sources combinées : Norvig, Lewand, Lexique3)
 REF_FREQ = {
@@ -78,14 +78,24 @@ def unsharp(gray, sigma=1.0, strength=0.6):
     blur = cv2.GaussianBlur(gray, (0, 0), sigma)
     return cv2.addWeighted(gray, 1 + strength, blur, -strength, 0)
 
-def otsu_with_bias(gray, bias=8):
+def otsu_with_bias(gray, bias=5):
     # Otsu puis on relève un peu le seuil pour ne PAS boucher les ouvertures
     t, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
     t = max(0, min(255, t + bias))
     _, bw = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY)
     return bw
 
-def preprocess_image(pil_img):
+def sauvola_threshold(gray, window=25, k=0.2):
+    thresh_sauvola = filters.threshold_sauvola(gray, window_size=window, k=k)
+    binary = gray > thresh_sauvola
+    return img_as_ubyte(binary)
+
+def niblack_threshold(gray, window=25, k=0.8):
+    thresh = filters.threshold_niblack(gray, window_size=window, k=k)
+    binary = gray > thresh
+    return img_as_ubyte(binary)
+
+def preprocess_image(pil_img,method="otsu"):
     # 0) légère montée d’échelle pour stabiliser les chiffres fins
     up = pil_img.resize(
         (int(pil_img.width * 1.5), int(pil_img.height * 1.5)),
@@ -99,11 +109,15 @@ def preprocess_image(pil_img):
     gray = np.array(up.convert("L"))
     gray = clahe(gray, clip=2.0, grid=8)
 
-    # 3) unsharp léger (sigma 1.0, strength 0.6) : rend les bords nets sans halo
-    gray = unsharp(gray, sigma=1.0, strength=0.6)
-
-    # 4) binarisation douce : Otsu + petit biais vers le blanc
-    bw = otsu_with_bias(gray, bias=5)
+    # 3) Sélection du mode de binarisation
+    if method == "otsu":
+        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    elif method == "sauvola":
+        bw = sauvola_threshold(gray, window=25, k=0.3)
+    elif method == "niblack":
+        bw = niblack_threshold(gray, window=25, k=0.8)
+    else:
+        raise ValueError(f"❌ Unknown preprocessing method: {method}")
 
     # 5) sortie PIL + autocontrast + autocrop
     pil_out = Image.fromarray(bw)
@@ -141,12 +155,20 @@ def map_country(country_code: str) -> str:
     }
     return mapping.get(country_code, TESSERACT_LANGS)
 
+KEY_LETTERS = list("ecoagpnrvthkslyq")
+
+def compute_letter_freq(text: str):
+    text_lower = text.lower()
+    total_letters = sum(c.isalpha() for c in text_lower) or 1
+    cnt = Counter(c for c in text_lower if c in KEY_LETTERS)
+    return {f"freq_{l}": round(cnt.get(l, 0) / total_letters * 100, 2) for l in KEY_LETTERS}
+
 # ----------------------------------------------------------------------
 # 🚀 Unified dispatcher
 # ----------------------------------------------------------------------
 def process_all_docs(raw_dir, out_dir, report_file,
                      backend="tesseract", force=False, country_hint=None,
-                     limit=None, threads=1, batch_size=8):
+                     limit_ocr=None, threads=1, batch_size=4, preproc_method="sauvola"):
     """
     Single entrypoint for all OCR pipelines.
     Chooses CPU or GPU path depending on backend.
@@ -156,16 +178,16 @@ def process_all_docs(raw_dir, out_dir, report_file,
 
     pdfs = sorted(raw_dir.glob("*.pdf"))
     pngs = sorted(raw_dir.glob("*.png"))
-    docs = (pdfs + pngs)[:limit] if limit else (pdfs + pngs)
+    docs = (pdfs + pngs)[:limit_ocr] if limit_ocr else (pdfs + pngs)
 
     print(f"➡️  {len(docs)} documents found (backend={backend})")
-
+    print(f"➡️ Preprocessing method: {preproc_method}")
     if backend in ("tesseract", "paddleocr"):
         process_all_CPU(docs, out_dir, report_file, backend=backend,
-                        threads=threads, force=force, country_hint=country_hint)
+                        threads=threads, force=force, country_hint=country_hint,preproc_method=preproc_method)
     elif backend in ("doctr", "easyocr"):
         process_all_GPU(docs, out_dir, report_file, backend=backend,
-                        batch_size=batch_size,force =force)
+                        batch_size=batch_size,force =force,preproc_method=preproc_method)
     else:
         raise ValueError(f"❌ Unsupported backend: {backend}")
 
@@ -175,7 +197,7 @@ def process_all_docs(raw_dir, out_dir, report_file,
 # ----------------------------------------------------------------------
 def process_one_CPU(args):
     """Worker executed in subprocesses."""
-    doc, out_dir, backend, force, country_hint = args
+    doc, out_dir, backend, force, country_hint, preproc_method = args
     out_file = out_dir / f"{doc.stem}.txt"
     if out_file.exists() and not force:
         return {"file_name": doc.name, "status": "skipped"}
@@ -186,9 +208,9 @@ def process_one_CPU(args):
     if backend == "tesseract":
         if doc.suffix.lower() == ".pdf":
             images = convert_from_path(doc, dpi=300, first_page=1, last_page=1)
-            img = preprocess_image(images[0]) if images else None
+            img = preprocess_image(pil_img=images[0], method=preproc_method)
         else:
-            img = preprocess_image(Image.open(doc))
+            img = preprocess_image(pil_img=Image.open(doc), method=preproc_method)
         text = pytesseract.image_to_string(img, lang=lang) if img else ""
 
     else:
@@ -196,36 +218,26 @@ def process_one_CPU(args):
 
     out_file.write_text(text, encoding="utf-8")
 
-    # 💡 Compte uniquement les lettres pertinentes
-    key_letters = list("ecoagpnrvthkslyq")
-    text_lower = text.lower()
-    total_letters = sum(c.isalpha() for c in text_lower) or 1
-    cnt = Counter(c for c in text_lower if c in key_letters)
-    counts = {l: cnt.get(l, 0) / total_letters * 100 for l in key_letters}
+    freqs = compute_letter_freq(text)
 
-
-    # ✅ Retourne uniquement les champs connus
-    res = {"file_name": doc.name, "status": "ok"}
-    for l in key_letters:
-        res[f"freq_{l}"] = round(counts[l], 2)
-
-    return res
+    return {
+        "file_name": doc.name,
+        "status": "ok",
+        **freqs
+    }
 
 
 def process_all_CPU(
     docs, out_dir, report_file,
-    backend="tesseract", threads=4, force=False, country_hint=None
+    backend="tesseract", threads=4, force=False, country_hint=None,preproc_method="sauvola"
 ):
     """Multi-process CPU OCR pipeline."""
     start = time.time()
 
     # 🧩 Prépare les arguments complets pour chaque worker
-    args = [(doc, out_dir, backend, force, country_hint) for doc in docs]
+    args = [(doc, out_dir, backend, force, country_hint, preproc_method) for doc in docs]
 
-    # 🧠 Lettres les plus sensibles aux erreurs de boucle / fermeture
-    key_letters = list("ecoagpnrvthkslyq")
-
-    fieldnames = ["file_name", "status"] + [f"freq_{l}" for l in key_letters]
+    fieldnames = ["file_name", "status"] + [f"freq_{l}" for l in KEY_LETTERS]
     # ---- Run multiprocessing ----
     with report_file.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -235,10 +247,6 @@ def process_all_CPU(
             for res in tqdm(pool.map(process_one_CPU, args), total=len(docs),
                             desc=f"🧩 OCR CPU ({backend})"):
 
-                # ✅ garde uniquement les champs prévus
-                filtered = {k: v for k, v in res.items() if k in fieldnames or not k.startswith("freq_")}
-                for l in key_letters:
-                    filtered.setdefault(f"freq_{l}", 0.0)
 
                 writer.writerow(res)
 
@@ -248,176 +256,153 @@ def process_all_CPU(
 
 
 # ----------------------------------------------------------------------
-# ⚡ GPU PIPELINE — (docTR / EasyOCR)
+# GPU PIPELINE — (docTR) — MPS / CUDA / CPU compatible
 # ----------------------------------------------------------------------
-def preprocess_pdf_for_doctr(path_str: str):
-    """TOP-LEVEL: returns (path_str, PIL.Image RGB)."""
+def preprocess_pdf_for_doctr(path: Path, preproc_method: str = "sauvola"):
     try:
-        p = Path(path_str)
-        imgs = convert_from_path(p, dpi=300, first_page=1, last_page=1)
+        imgs = convert_from_path(path, dpi=300, first_page=1, last_page=1)
         if not imgs:
-            print(f"[WARN] No page extracted from {p.name}")
             return None
-        pil_rgb = imgs[0].convert("RGB")
-        print(f"[INFO preprocess-pdf] {p.name}: PIL RGB {pil_rgb.size}")
-        return (path_str, pil_rgb)
+        return preprocess_image(imgs[0], method=preproc_method)
     except Exception as e:
-        print(f"[ERROR preprocess-pdf] {Path(path_str).name}: {e}")
+        print(f"[ERROR preprocess-pdf] {path.name}: {e}")
         return None
 
-def process_all_GPU(docs, out_dir, report_file,
-                    backend="doctr", batch_size=8, force=False):
-    """
-    Batch GPU pipeline.
-    Each backend (doctr, easyocr, etc.) handled via if/elif.
-    """
-    import torch, gc
-    from tqdm import tqdm
 
-    if torch.backends.mps.is_available():
-        device = "mps"
-    elif torch.cuda.is_available():
+def process_all_GPU(docs, out_dir, report_file,
+                    backend="doctr", batch_size=4, force=False, preproc_method="sauvola"):
+    import torch
+    from doctr.io import DocumentFile
+    from doctr.models import ocr_predictor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tqdm import tqdm
+    from io import BytesIO
+
+    # --- Device ---
+    if torch.cuda.is_available():
         device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
     else:
         device = "cpu"
+    print(f"GPU OCR ({backend.upper()}) on {device} | batch_size={batch_size}")
 
-    print(f"🚀 Using {backend.upper()} on {device} (batch={batch_size})")
-
-    # 🧹 Filtrage des fichiers (skip existants si pas --force)
-    todo = []
-    skipped = []
-    for p in docs:
-        out_txt = out_dir / f"{p.stem}.txt"
-        if out_txt.exists() and not force:
-            skipped.append(p)
-        else:
-            todo.append(p)
-
-    print(f"📂 {len(todo)} to process, {len(skipped)} skipped (existing files)")
-
+    # --- Filtrer les fichiers ---
+    todo = [doc for doc in docs if not (out_dir / f"{doc.stem}.txt").exists() or force]
     if not todo:
-        print("🎉 Nothing to process, all files already OCR’d.")
+        print("Nothing to process.")
         return
 
-    # Backend = docTR
-    if backend == "doctr":
-        from doctr.io import DocumentFile
-        from doctr.models import ocr_predictor
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        import queue, threading, gc
+    # --- Modèle ---
+    predictor = ocr_predictor(
+        det_arch="linknet_resnet18",
+        reco_arch="sar_resnet31",
+        pretrained=True
+    ).to(device)
 
-        predictor = ocr_predictor(
-            det_arch="linknet_resnet18",
-            reco_arch="sar_resnet31",
-            pretrained=True
-        ).to(device)
-
-
-
-        def process_all_async(todo, out_dir, writer):
-            q = queue.Queue(maxsize=batch_size)
-            total = len(todo)
-            pbar_pre = tqdm(total=total, desc="🧱 CPU preprocess", position=0, leave=True)
-            pbar_ocr = tqdm(total=total, desc="🤖 GPU OCR (docTR)", position=1, leave=True)
-
-            def producer():
-                pdfs = [d for d in todo if d.suffix.lower() == ".pdf"]
-                imgs = [d for d in todo if d.suffix.lower() != ".pdf"]
-
-                # PDFs via process pool -> returns PIL.Image
-                with ProcessPoolExecutor(max_workers=4) as pool:
-                    futs = [pool.submit(preprocess_pdf_for_doctr, str(d)) for d in pdfs]
-                    for fut in as_completed(futs):
-                        res = fut.result()
-                        if res is not None:
-                            q.put(res)   # (path_str, PIL.Image)
-                        pbar_pre.update(1)
-
-                # PNG/JPG inline -> also push PIL.Image
-                for d in imgs:
-                    try:
-                        pil_rgb = Image.open(d).convert("RGB")
-                        q.put((str(d), pil_rgb))
-                    except Exception as e:
-                        print(f"[ERROR preprocess-img] {d.name}: {e}")
-                    finally:
-                        pbar_pre.update(1)
-
-                q.put(None)
-
-            def consumer(batch_size=4):
-                batch = []
-                metas = []
-                while True:
-                    item = q.get()
-                    if item is None:
-                        # Traiter le dernier batch
-                        if batch:
-                            process_batch(batch, metas)
-                        break
-
-                    path_str, pil_img = item
-                    batch.append(pil_img)
-                    metas.append(path_str)
-
-                    if len(batch) >= batch_size:
-                        process_batch(batch, metas)
-                        batch, metas = [], []
-
-            def process_batch(batch, metas):
-                try:
-                    bufs = []
-                    for img in batch:
-                        buf = BytesIO()
-                        img.save(buf, format="PNG")
-                        bufs.append(buf.getvalue())
-
-                    docfile = DocumentFile.from_images(bufs)
-                    result = predictor(docfile)
-                    rendered = result.render()
-                    if isinstance(rendered, list):
-                        for meta, text in zip(metas, rendered):
-                            p = Path(meta)
-                            (out_dir / f"{p.stem}.txt").write_text(text, encoding="utf-8")
-                            writer.writerow({"file_name": p.name, "status": "ok"})
-                    else:
-                        # fallback si docTR ne renvoie pas une liste
-                        for meta in metas:
-                            p = Path(meta)
-                            (out_dir / f"{p.stem}.txt").write_text(rendered, encoding="utf-8")
-                            writer.writerow({"file_name": p.name, "status": "ok"})
-                except Exception as e:
-                    print(f"❌ Error batch {[Path(m).name for m in metas]}: {e}")
-                    for meta in metas:
-                        writer.writerow({"file_name": Path(meta).name, "status": "error"})
-                finally:
-                    pbar_ocr.update(len(batch))
-                    gc.collect()
-
-            t = threading.Thread(target=producer, daemon=True)
-            t.start()
-            consumer()
-            t.join()
-            pbar_pre.close(); pbar_ocr.close()
-
-
-    # ---- Execution adaptative (async pour docTR) ----
-    start = time.time()
+    # --- CSV ---
+    fieldnames = ["file_name", "status"] + [f"freq_{l}" for l in KEY_LETTERS]
     with report_file.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["file_name", "status"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        if backend == "doctr":
-            print("🧠 Running async docTR pipeline (CPU→GPU overlap)...")
-            process_all_async(todo, out_dir, writer)
-        else:
-            raise ValueError(f"❌ Unsupported GPU backend: {backend}")
+        # --- Chargement + préproc ---
+        def load_and_preprocess(doc_path):
+            try:
+                if doc_path.suffix.lower() == ".pdf":
+                    pil_img = preprocess_pdf_for_doctr(doc_path, preproc_method)
+                else:
+                    pil_img = Image.open(doc_path).convert("RGB")
+                    pil_img = preprocess_image(pil_img, method=preproc_method)
+                if pil_img is None:
+                    return doc_path, None
 
-    total = time.time() - start
-    avg = total / max(1, len(todo))
-    print(f"✅ GPU {backend} done: {total:.1f}s total ({avg:.2f}s/doc)")
+                # → Convertir en bytes PNG (nécessaire pour MPS)
+                buf = BytesIO()
+                pil_img.save(buf, format="PNG")
+                return doc_path, buf.getvalue()
+            except Exception as e:
+                print(f"[ERROR load] {doc_path.name}: {e}")
+                return doc_path, None
 
+        # --- Batch processing ---
+        batch_bytes = []
+        batch_metas = []
+        pbar = tqdm(total=len(todo), desc="OCR GPU (docTR)", leave=True)
 
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_doc = {executor.submit(load_and_preprocess, doc): doc for doc in todo}
+
+            for future in as_completed(future_to_doc):
+                doc_path, img_bytes = future.result()
+
+                if img_bytes is None:
+                    writer.writerow({"file_name": doc_path.name, "status": "error"})
+                    pbar.update(1)
+                    continue
+
+                batch_bytes.append(img_bytes)
+                batch_metas.append(doc_path)
+
+                # --- Batch plein ---
+                if len(batch_bytes) >= batch_size:
+                    texts = []  # ← Toujours défini
+                    try:
+                        # → from_images accepte list[bytes]
+                        docfile = DocumentFile.from_images(batch_bytes)
+                        result = predictor(docfile)
+                        texts = [page.render() for page in result.pages]
+
+                        for meta_doc, text in zip(batch_metas, texts):
+                            out_path = out_dir / f"{meta_doc.stem}.txt"
+                            out_path.write_text(text, encoding="utf-8")
+                            freqs = compute_letter_freq(text)
+                            writer.writerow({
+                                "file_name": meta_doc.name,
+                                "status": "ok",
+                                **freqs
+                            })
+                    except Exception as e:
+                        print(f"Batch error: {e}")
+                        for meta in batch_metas:
+                            writer.writerow({"file_name": meta.name, "status": "error"})
+                        texts = []  # même en erreur
+                    finally:
+                        batch_bytes.clear()
+                        batch_metas.clear()
+                        pbar.update(len(texts))
+                        if device == "cuda":
+                            torch.cuda.empty_cache()
+
+            # --- Dernier batch ---
+            if batch_bytes:
+                texts = []
+                try:
+                    docfile = DocumentFile.from_images(batch_bytes)
+                    result = predictor(docfile)
+                    texts = [page.render() for page in result.pages]
+
+                    for meta_doc, text in zip(batch_metas, texts):
+                        out_path = out_dir / f"{meta_doc.stem}.txt"
+                        out_path.write_text(text, encoding="utf-8")
+                        freqs = compute_letter_freq(text)
+                        writer.writerow({
+                            "file_name": meta_doc.name,
+                            "status": "ok",
+                            **freqs
+                        })
+                except Exception as e:
+                    print(f"Final batch error: {e}")
+                    for meta in batch_metas:
+                        writer.writerow({"file_name": meta.name, "status": "error"})
+                finally:
+                    pbar.update(len(texts))
+
+        pbar.close()
+
+    total_time = pbar.format_dict["elapsed"]
+    avg = total_time / max(1, len(todo))
+    print(f"GPU {backend} done: {total_time:.1f}s total ({avg:.2f}s/doc)")
 
 # ----------------------------------------------------------------------
 # 🎛️ CLI Entrypoint
@@ -430,16 +415,22 @@ if __name__ == "__main__":
     p.add_argument("--backend", type=str, default="tesseract",
                    choices=["tesseract", "doctr", "easyocr"])
     p.add_argument("--threads", type=int, default=4)
-    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--force", action="store_true")
-    p.add_argument("--limit", type=int)
+    p.add_argument("--limit_ocr", type=int)
+    p.add_argument("--country_hint", type=str, default=None,
+               help="Force country code for all docs (e.g., 'ch', 'fr')")
+    p.add_argument("--preproc_method", type=str, default="sauvola",
+               choices=["otsu", "sauvola", "niblack"],
+               help="OCR preprocessing method to use")
+
     args = p.parse_args()
 
     process_all_docs(
         args.raw_dir, args.out_dir, args.report_file,
         backend=args.backend, force=args.force,
-        limit=args.limit, threads=args.threads,
-        batch_size=args.batch_size
+        limit_ocr=args.limit_ocr, threads=args.threads,
+        batch_size=args.batch_size, country_hint=args.country_hint, preproc_method=args.preproc
     )
 
     print(f"📊 Report generated: {args.report_file}")
