@@ -28,6 +28,7 @@ datasets/
 *.safetensors
 *.bin
 *.pt
+*.png
 
 # --- Outputs ---
 data/ocr_text/
@@ -39,6 +40,7 @@ compare_benchmark
 # --- Raw data (too heavy for git) ---
 data/raw_pdf/
 data/gold_standard_DE/
+data/predictions/
 
 
 # --- Temp / OS ---
