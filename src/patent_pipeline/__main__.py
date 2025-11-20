@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--limit_ocr", type=int, default=None)
     parser.add_argument("--limit_llm", type=int, default=None)
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--country_hint", type=str, default="ch")
+    parser.add_argument("--country_hint", type=str, default="de")
     parser.add_argument("--preproc_method", type=str, default="sauvola")
     parser.add_argument("--skip_extraction", action="store_true", help="Skip LLM feature extraction (only OCR).")
 

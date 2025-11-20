@@ -29,6 +29,12 @@ dependencies = [
     "easyocr (>=1.7.2,<2.0.0)",
     "matplotlib (>=3.10.7,<4.0.0)",
     "pyqt5 (>=5.15.11,<6.0.0)",
+    "pandas (>=2.3.3,<3.0.0)",
+    "seaborn (>=0.13.2,<0.14.0)",
+    "bs4 (>=0.0.2,<0.0.3)",
+    "streamlit (>=1.51.0,<2.0.0)",
+    "streamlit-image-zoom (>=0.0.4,<0.0.5)",
+    "layoutparser[detectron2] (>=0.3.4,<0.4.0)",
 ]
 
 [tool.poetry]

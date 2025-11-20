@@ -13,6 +13,16 @@ import numpy as np
 from io import BytesIO
 from collections import Counter
 from skimage import filters, img_as_ubyte
+from huggingface_hub import hf_hub_download
+from doclayout_yolo import YOLOv10
+filepath = hf_hub_download(
+    repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
+    filename="doclayout_yolo_docstructbench_imgsz1024.pt"
+)
+model = YOLOv10(filepath)
+
+
+
 
 # 📚 Fréquences moyennes par langue (sources combinées : Norvig, Lewand, Lexique3)
 REF_FREQ = {
@@ -52,7 +62,6 @@ def deskew_image(pil_img, max_angle: float = 10.0):
     rotated = cv2.warpAffine(img_cv, M, (w, h),
                              flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     return Image.fromarray(rotated)
-
 
 def autocrop_image(pil_img, threshold=245):
     """
@@ -125,6 +134,51 @@ def preprocess_image(pil_img,method="otsu"):
     pil_out = autocrop_image(pil_out, threshold=245)
     return pil_out
 
+def yolo_segment_and_ocr(img, lang, config):
+    """
+    Segmente l'image en blocs (nombre auto) grâce à YOLO DocLayNet.
+    OCRise chaque bloc séparément.
+    Recompose en un texte propre.
+    """
+    # Convertir en RGB (YOLO attend RGB)
+    if img.ndim == 2:
+        rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    else:
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # --- 1) YOLO segmentation ---
+    results = _yolo_layout(rgb)[0]   # une seule image
+
+    blocks = []
+    for b in results.boxes:
+        x1, y1, x2, y2 = b.xyxy[0].tolist()
+        label = _yolo_layout.names[int(b.cls[0])]
+        conf = float(b.conf[0])
+        blocks.append({
+            "bbox": (x1, y1, x2, y2),
+            "label": label,
+            "conf": conf
+        })
+
+    # --- 2) Tri des blocs dans l'ordre de lecture ---
+    blocks = sorted(blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+
+    # --- 3) OCR de chaque bloc ---
+    texts = []
+
+    for blk in blocks:
+        x1, y1, x2, y2 = map(int, blk["bbox"])
+        crop = rgb[y1:y2, x1:x2]
+
+        # OCR Tesseract sur le crop
+        t = pytesseract.image_to_string(crop, lang=lang, config=config)
+        t = t.strip()
+        if t:
+            texts.append(t)
+
+    # --- 4) Reconstruction propre ---
+    final_text = "\n\n".join(texts)
+    return final_text
 
 # ----------------------------------------------------------------------
 # 🌍 Helpers
@@ -211,7 +265,30 @@ def process_one_CPU(args):
             img = preprocess_image(pil_img=images[0], method=preproc_method)
         else:
             img = preprocess_image(pil_img=Image.open(doc), method=preproc_method)
-        text = pytesseract.image_to_string(img, lang=lang) if img else ""
+
+        # config = (
+        #     "--oem 1 "
+        #     "--psm 4 "
+        #     "-c textord_noise_rej=0 "
+        #     "-c textord_min_xheight=8"
+        #     "-c preserve_interword_spaces=1"
+        # )
+
+        # config = (
+        #     # "--oem 1 "
+        #     # "--psm 12 "
+        #     "-c textord_noise_rej=0 "
+        #     "-c textord_min_xheight=8"
+        # ) #Basic config --- IGNORE ---
+
+        # text = pytesseract.image_to_string(img, lang=lang, config = config) if img else ""
+        config = (
+            "--oem 1"
+            "--psm 6"
+            "-c preserve_interword_spaces=1 "
+            "-c textord_min_xheight=10 "
+            )
+        text = yolo_segment_and_ocr(img, lang, config)
 
     else:
         raise ValueError(f"Unknown CPU backend: {backend}")

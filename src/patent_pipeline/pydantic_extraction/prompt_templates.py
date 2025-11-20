@@ -10,22 +10,23 @@ Extract the following fields as a single valid JSON object:
 - pub_date_publication (YYYY-MM-DD or null)
 - pub_date_foreign (YYYY-MM-DD or null)
 - classification (string or null)
-- industrial_field (short English category)
+- industrial_field (short class category, in original language)
 
 Rules:
 - Always output valid JSON.
 - If a field is missing, use null.
 - Each inventor/assignee must have both name and address fields if possible.
-- Addresses must be translated in English, formatted as "City (Country)".
+- Addresses, formatted as in the document.
 - Dates must be in YYYY-MM-DD format.
 - The title must NOT be translated.
+- The industrial_field must NOT be translated.
 
 Example output:
 {{
   "title": "Dispositif de chauffage solaire à collecteurs modulaires",
   "inventors": [
-    {{"name": "Dr. Alice Montreux", "address": "Geneva (Switzerland)"}},
-    {{"name": "Marc-André Keller", "address": "Zurich (Switzerland)"}}
+    {{"name": "Dr. Alice Montreux", "address": "Geneva"}},
+    {{"name": "Marc-André Keller", "address": "Zurich"}}
   ],
   "assignees": [
     {{"name": "HelioTech SA", "address": "Lausanne (Switzerland)"}}
@@ -41,6 +42,100 @@ Example output:
 Text:
 {text}
 """
+
+
+PROMPT_EXTRACTION = """
+Du bist ein Assistent, der strukturierte bibliographische Daten aus einem deutschen Patentdokument extrahiert.
+
+Deine Aufgabe:
+Extrahiere die folgenden Felder und gib sie als ein einzelnes, gültiges JSON-Objekt zurück:
+
+- title (string, im Originaltext, NICHT übersetzen)
+- inventors (Liste von Objekten mit Feldern: name, address)
+- assignees (Liste von Objekten mit Feldern: name, address)
+- pub_date_application (YYYY-MM-DD oder null)
+- pub_date_publication (YYYY-MM-DD oder null)
+- pub_date_foreign (YYYY-MM-DD oder null)
+- classification (string oder null)
+- industrial_field (kurze Klassifikationskategorie, im Originaltext, NICHT übersetzen)
+
+Regeln:
+- Gib IMMER ein gültiges JSON-Objekt aus.
+- Wenn ein Feld fehlt, verwende null.
+- Jeder Erfinder (inventor) und Anmelder (assignee) soll nach Möglichkeit sowohl name als auch address enthalten.
+- Adressen sollen so formatiert sein, wie sie im Dokument erscheinen.
+- Datumsangaben müssen im Format YYYY-MM-DD stehen.
+- Der Titel und das industrielle Fachgebiet dürfen NICHT übersetzt oder verändert werden.
+- Verwende keine zusätzlichen Kommentare oder Erklärungen außerhalb des JSON.
+- Falls im Dokument mehrere Veröffentlichungsdaten erscheinen, wähle GRUNDSÄTZLICH das ÄLTESTE Datum als pub_date_publication.
+- Trage das Feld industrial_field NUR ein, wenn es im Dokument EXPLIZIT nach der Klassifikationsnummer angegeben ist; andernfalls verwende null.
+
+
+Beispielausgabe:
+{{
+  "title": "Dispositif de chauffage solaire à collecteurs modulaires",
+  "inventors": [
+    {{"name": "Dr. Alice Montreux", "address": "Genf"}},
+    {{"name": "Marc-André Keller", "address": "Zürich"}}
+  ],
+  "assignees": [
+    {{"name": "HelioTech SA", "address": "Lausanne (Schweiz)"}}
+  ],
+  "pub_date_application": "1974-06-14",
+  "pub_date_publication": "1976-02-02",
+  "pub_date_foreign": null,
+  "classification": "15b",
+  "industrial_field": "Erneuerbare Energiesysteme"
+}}
+
+Text:
+{text}
+"""
+
+
+# PROMPT_EXTRACTION = """You are an assistant extracting structured bibliographic data from a patent document.
+
+# Your task:
+# Extract the following fields as a single valid JSON object:
+
+# - title (string, original language)
+# - inventors (list of objects with fields: name, address)
+# - assignees (list of objects with fields: name, address)
+# - pub_date_application (YYYY-MM-DD or null)
+# - pub_date_publication (YYYY-MM-DD or null)
+# - pub_date_foreign (YYYY-MM-DD or null)
+# - classification (string or null)
+# - industrial_field (short English category)
+
+# Rules:
+# - Always output valid JSON.
+# - If a field is missing, use null.
+# - Each inventor/assignee must have both name and address fields if possible.
+# - Addresses must be translated in English, formatted as "City (Country)".
+# - Dates must be in YYYY-MM-DD format.
+# - The title must NOT be translated.
+
+# Example output:
+# {{
+#   "title": "Dispositif de chauffage solaire à collecteurs modulaires",
+#   "inventors": [
+#     {{"name": "Dr. Alice Montreux", "address": "Geneva (Switzerland)"}},
+#     {{"name": "Marc-André Keller", "address": "Zurich (Switzerland)"}}
+#   ],
+#   "assignees": [
+#     {{"name": "HelioTech SA", "address": "Lausanne (Switzerland)"}}
+#   ],
+#   "pub_date_application": "1974-06-14",
+#   "pub_date_publication": "1976-02-02",
+#   "pub_date_foreign": null,
+#   "classification": "15b",
+#   "industrial_field": "Renewable energy systems"
+# }}
+
+
+# Text:
+# {text}
+# """
 # PROMPT_EXTRACTION = """You are an assistant extracting structured bibliographic data from a patent document.
 
 # Your task:

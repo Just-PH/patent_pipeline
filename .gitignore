@@ -35,7 +35,7 @@ data/ocr_text/
 *.out
 *.tar
 *.gz
-
+compare_benchmark
 # --- Raw data (too heavy for git) ---
 data/raw_pdf/
 data/gold_standard_DE/
