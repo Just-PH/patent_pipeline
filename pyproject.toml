@@ -35,6 +35,7 @@ dependencies = [
     "streamlit (>=1.51.0,<2.0.0)",
     "streamlit-image-zoom (>=0.0.4,<0.0.5)",
     "layoutparser[detectron2] (>=0.3.4,<0.4.0)",
+    "pymupdf (>=1.26.6,<2.0.0)",
 ]
 
 [tool.poetry]
