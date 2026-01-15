@@ -1,61 +1,78 @@
+# src/patent_pipeline/patent_ocr/backends/tesseract_backend.py
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Any, Dict, List
+
 from PIL import Image
-import numpy as np
-import cv2
 import pytesseract
 
+from patent_pipeline.patent_ocr.utils.image_preprocess import preprocess_pil
 
+
+@dataclass
 class TesseractBackend:
     """
-    OCR backend for Tesseract.
-    Pure backend: no OcrEngine, no indirection.
+    Tesseract OCR backend (CPU).
+
+    - Uses shared preprocess_pil(...) to avoid duplication across backends.
+    - Works best with segmentation_mode="custom" on difficult layouts / fraktur.
     """
 
-    def __init__(self, *, is_gpu: bool = False):
-        # tesseract is always CPU, but keep signature uniform
-        self._is_gpu = False
-        self._name = "tesseract"
+    name_: str = "tesseract"
 
     @property
     def is_gpu(self) -> bool:
-        return self._is_gpu
+        return False
 
     @property
     def name(self) -> str:
-        return self._name
+        return self.name_
 
-    # --- preprocess (local to backend)
-    def _preprocess(self, pil_img: Image.Image, cfg: Dict[str, Any]) -> Image.Image:
-        mode = cfg.get("preprocess", "gray")
-
-        if mode == "none":
-            return pil_img
-
-        gray = np.array(pil_img.convert("L"))
-
-        if mode == "gray":
-            return Image.fromarray(gray)
-
-        if mode == "light":
-            gray = cv2.GaussianBlur(gray, (1, 1), 0)
-            return Image.fromarray(gray)
-
-        raise ValueError(f"Unknown preprocess mode for Tesseract: {mode}")
-
-    # --- OCR execution (PIPELINE ENTRYPOINT)
     def run_blocks_ocr(self, block_imgs: List[Any], ocr_config: Dict[str, Any]) -> List[str]:
-        results: List[str] = []
+        if not block_imgs:
+            return []
 
-        lang = ocr_config["lang"]
-        cfg = ocr_config["config"]
+        lang = ocr_config.get("lang", "")
+        config = ocr_config.get("config", "")
+        preprocess_mode = ocr_config.get("preprocess", "none")
 
-        for img in block_imgs:
-            pil_img = self._preprocess(img, ocr_config)
-            txt = pytesseract.image_to_string(
-                pil_img,
-                lang=lang,
-                config=cfg,
+        out: List[str] = []
+        for im in block_imgs:
+            pil = im if isinstance(im, Image.Image) else Image.fromarray(im).convert("RGB")
+
+            # ✅ shared preprocess
+            pil = preprocess_pil(pil, mode=preprocess_mode)
+
+            txt = pytesseract.image_to_string(pil, lang=lang, config=config)
+            out.append((txt or "").strip())
+
+        if len(out) != len(block_imgs):
+            raise RuntimeError(f"Tesseract backend returned {len(out)} texts for {len(block_imgs)} images")
+
+        return out
+
+    def validate_ocr_config(self, ocr_config: Dict[str, Any]) -> None:
+        lang = ocr_config.get("lang")
+        config = ocr_config.get("config")
+
+        missing = []
+        if not lang:
+            missing.append("lang")
+        if not config:
+            missing.append("config")
+
+        if missing:
+            raise ValueError(
+                "[TesseractBackend] Missing required ocr_config keys: "
+                f"{missing}. Example:\n"
+                "  ocr_config={"
+                "\"lang\":\"frk+deu\","
+                "\"config\":\"--psm 6 --oem 1 -c preserve_interword_spaces=1\","
+                "\"preprocess\":\"light\"}"
             )
-            results.append((txt or "").strip())
 
-        return results
+        if not isinstance(lang, str):
+            raise TypeError("[TesseractBackend] ocr_config['lang'] must be a string.")
+        if not isinstance(config, str):
+            raise TypeError("[TesseractBackend] ocr_config['config'] must be a string.")

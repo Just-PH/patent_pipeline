@@ -414,6 +414,10 @@ class Pipeline_OCR:
         workers_eff = int(cfg.workers)
         parallel_eff = str(cfg.parallel).lower().strip()
 
+        # --- Fail-fast: backend-specific config validation ---
+        if hasattr(self.ocr_backend, "validate_ocr_config"):
+            self.ocr_backend.validate_ocr_config(cfg.ocr_config or {})
+
         # GPU backends: avoid naive parallelism
         if self.ocr_backend.is_gpu and workers_eff > 1:
             workers_eff = 1
