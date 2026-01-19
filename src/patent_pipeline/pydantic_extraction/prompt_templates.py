@@ -1,3 +1,4 @@
+
 PROMPT_EXTRACTION_V1 = """
 You are an assistant that extracts structured bibliographic data from a German patent document.
 
@@ -81,7 +82,6 @@ Beispielausgabe 3:
 Text:
 {text}
 """
-
 
 PROMPT_EXTRACTION_V2 = """
 Du bist ein Assistent, der strukturierte bibliographische Daten aus einem deutschen Patentdokument extrahiert.
@@ -248,6 +248,12 @@ Beispielausgabe 3:
 Texte :
 {text}
 """
+
+PROMPTS = {
+  "v1": PROMPT_EXTRACTION_V1,
+  "v2": PROMPT_EXTRACTION_V2,
+  "v3": PROMPT_EXTRACTION_V3,
+}
 
 # PROMPT_EXTRACTION = """You are an assistant extracting structured bibliographic data from a patent document.
 

@@ -132,6 +132,13 @@ def main():
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--parallel", type=str, default="none", choices=["none", "threads", "processes"])
     parser.add_argument("--deskew-method", type=str, default="hough", help="Deskew method used by Deskewer")
+    parser.add_argument(
+        "--timings",
+        type=str,
+        default="off",
+        choices=["off", "basic", "detailed"],
+        help="Timing measurements: off|basic (total+ocr)|detailed (load/deskew/segment/ocr/write/total)",
+    )
     args = parser.parse_args()
 
     repo_dir = Path(__file__).resolve().parents[1]  # patent_pipeline/
@@ -183,6 +190,7 @@ def main():
         limit=args.limit,
         force=args.force,
         keep_empty_docs=args.keep_empty_docs,
+        timings=args.timings,
     )
 
     # Save run.json (metadata + full config)
@@ -199,6 +207,7 @@ def main():
         "texts_dir": str(texts_dir),
         "report_file": str(report_file),
         "segmentation": args.segmentation,
+        "timings": args.timings,
         "backend_spec": backend_spec,
         "backend_kwargs": backend_kwargs,
         "ocr_config": ocr_config,

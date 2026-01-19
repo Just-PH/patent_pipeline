@@ -1,0 +1,22 @@
+# Data & outputs
+data/
+output/
+models/
+compare_benchmark/
+*.jsonl
+*.csv
+
+# Caches
+__pycache__/
+*.pyc
+.hf_cache/
+.cache/
+.env
+
+# VCS
+.git/
+.gitignore
+
+# Notebooks / misc
+*.ipynb
+.DS_Store

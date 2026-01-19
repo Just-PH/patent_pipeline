@@ -1,95 +1,178 @@
-# 📄 src/patent_pipeline/pydantic/patent_extractor.py
-from pathlib import Path
-import traceback
-import os
-import json
-import regex as re
-from typing import Optional, Literal
-from pydantic import ValidationError
-from .models import PatentExtraction, PatentMetadata
-from .prompt_templates import PROMPT_EXTRACTION_V2
-from ..utils.device_utils import get_device
-from tqdm import tqdm
+# 📄 src/patent_pipeline/pydantic_extraction/patent_extractor.py
+"""
+PatentExtractor
 
-# Optional deps
+Rôle:
+- Charger un modèle (MLX ou PyTorch/Transformers)
+- Construire un prompt (via prompt_id v1/v2/v3 OU un template fourni)
+- Générer une sortie
+- Extraire un JSON du texte généré
+- Normaliser + valider via Pydantic (PatentMetadata)
+- (Option) mesurer des timings par document (off/basic/detailed)
+- Écrire des records JSONL consommables par la suite (scoring)
+
+Note importante (benchmark):
+- prompt_hash doit être STABLE par run → on hash le TEMPLATE + suffix fixe,
+  PAS le prompt final (qui inclut l'OCR et changerait par document).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Dict, Literal, Optional
+
+import regex as re
+import torch
+from pydantic import ValidationError
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+from .models import PatentExtraction, PatentMetadata
+from .prompt_templates import PROMPT_EXTRACTION_V1, PROMPT_EXTRACTION_V2, PROMPT_EXTRACTION_V3
+from ..utils.device_utils import get_device
+
+# Optional deps (MLX on Apple Silicon)
 try:
     import mlx_lm
+
     _HAS_MLX = True
 except ImportError:
     _HAS_MLX = False
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+# ---------------------------------------------------------------------------
+# Prompt registry (matrice 3D : prompts = [v1, v2, v3])
+# ---------------------------------------------------------------------------
+_PROMPT_BY_ID: Dict[str, str] = {
+    "v1": PROMPT_EXTRACTION_V1,
+    "v2": PROMPT_EXTRACTION_V2,
+    "v3": PROMPT_EXTRACTION_V3,
+}
+
+_JSON_ONLY_SUFFIX = "\n\nNow output ONLY the JSON object, without any extra text.\n"
+
+
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 class PatentExtractor:
     """
     Extracteur de métadonnées de brevets à partir de textes OCR.
 
-    Supporte MLX (Apple Silicon) et PyTorch (CPU/CUDA).
-    Utilise un LLM pour extraire des champs structurés via Pydantic.
+    Supporte:
+    - MLX (Apple Silicon) : rapide en local dev sur Mac
+    - PyTorch (CPU/CUDA)  : pour VM/H100
+
+    La dimension "prompt" devient une vraie dimension de benchmark via:
+    - prompt_id: "v1"/"v2"/"v3"
+      OU
+    - prompt_template: template string contenant "{text}"
     """
 
     def __init__(
         self,
         model_name: Optional[str] = None,
         backend: Literal["auto", "mlx", "pytorch"] = "auto",
+        device: Optional[str] = None,
+        # Prompt selection
+        prompt_id: Optional[str] = None,
         prompt_template: Optional[str] = None,
+        # Generation params
         max_ocr_chars: int = 10000,
         max_new_tokens: int = 1024,
         temperature: float = 0.0,
         do_sample: bool = False,
-        device: Optional[str] = None,
+        # Timings
+        timings: Literal["off", "basic", "detailed"] = "off",
     ):
-        """
-        Initialise l'extracteur avec un modèle LLM.
-
-        Args:
-            model_name: Nom du modèle HuggingFace (défaut: env HF_MODEL ou Mistral-7B)
-            backend: "mlx" (Mac), "pytorch" (CPU/CUDA), ou "auto" (détection)
-            prompt_template: Template de prompt personnalisé (défaut: PROMPT_EXTRACTION_V2)
-            max_ocr_chars: Nombre max de caractères OCR à envoyer au modèle
-            max_new_tokens: Tokens max générés par le modèle
-            temperature: Température de génération (0 = déterministe)
-            do_sample: Active le sampling (False pour reproductibilité)
-            device: Device PyTorch ('cpu', 'cuda', 'mps'), auto-détecté si None
-        """
+        # ----------------------------
+        # Basic config
+        # ----------------------------
         self.model_name = model_name or os.getenv("HF_MODEL", "mlx-community/Mistral-7B-Instruct-v0.3")
-        self.prompt_template = prompt_template or PROMPT_EXTRACTION_V2
         self.max_ocr_chars = max_ocr_chars
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.do_sample = do_sample
+        self.timings = timings
 
-        # Détection du backend
+        # Constant suffix (part of prompt hash)
+        self.prompt_suffix = _JSON_ONLY_SUFFIX
+
+        # ----------------------------
+        # Prompt config (matrice 3D)
+        # ----------------------------
+        self.prompt_id = prompt_id
+
+        if self.prompt_id is not None:
+            if self.prompt_id not in _PROMPT_BY_ID:
+                raise ValueError(f"Unknown prompt_id={self.prompt_id!r}. Allowed: {sorted(_PROMPT_BY_ID.keys())}")
+            self.prompt_template = _PROMPT_BY_ID[self.prompt_id]
+            self.prompt_template_source = f"prompt_id:{self.prompt_id}"
+        else:
+            self.prompt_template = prompt_template or PROMPT_EXTRACTION_V2
+            self.prompt_template_source = "inline_template" if prompt_template else "default:v2"
+
+        if "{text}" not in self.prompt_template:
+            raise ValueError("Le template doit contenir le placeholder {text}")
+
+        # ✅ STABLE par run: template + suffix (pas le prompt rendu avec OCR)
+        self.prompt_hash = _sha256(self.prompt_template + self.prompt_suffix)
+
+        # ----------------------------
+        # Backend selection
+        # ----------------------------
         if backend == "auto":
             self.backend = "mlx" if _HAS_MLX else "pytorch"
         else:
             self.backend = backend
-            if backend == "mlx" and not _HAS_MLX:
+            if self.backend == "mlx" and not _HAS_MLX:
                 raise ImportError("MLX n'est pas installé. Installe avec: pip install mlx-lm")
 
-        # Détection du device pour PyTorch
+        # ----------------------------
+        # Device selection (PyTorch)
+        # ----------------------------
         self.device = device or get_device()
+
+        # NOTE: MPS est souvent instable pour Transformers “text-generation”.
         if self.backend == "pytorch" and self.device == "mps":
             print("⚠️  MPS backend instable → fallback CPU")
             self.device = "cpu"
 
-        # Chargement du modèle
+        # last per-document timings set by extract()
+        self._last_timing: Optional[Dict[str, float]] = None
+
+        # Model objects
+        self.model = None
+        self.tokenizer = None
+        self.pipe = None
+
+        # ----------------------------
+        # Load model
+        # ----------------------------
         self._load_model()
 
-    def _load_model(self):
+    # =========================================================================
+    # Model loading / generation
+    # =========================================================================
+
+    def _load_model(self) -> None:
         """Charge le modèle selon le backend configuré."""
         print(f"🧠 Backend: {self.backend}")
         print(f"📦 Model: {self.model_name}")
 
         if self.backend == "mlx":
-            print("⚙️  Loading via MLX (quantized int4/int8)")
+            print("⚙️  Loading via MLX")
             self.model, self.tokenizer = mlx_lm.load(self.model_name)
             self.pipe = None
+            return
 
-        elif self.backend == "pytorch":
-            # Config PyTorch pour stabilité MPS
+        if self.backend == "pytorch":
             os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
             os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
@@ -101,73 +184,79 @@ class PatentExtractor:
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 torch_dtype=dtype,
-                device_map=map_arg
+                device_map=map_arg,
             )
             self.pipe = pipeline(
                 "text-generation",
                 model=self.model,
                 tokenizer=self.tokenizer,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                do_sample=self.do_sample
             )
+            return
 
-    def set_prompt_template(self, template: str):
-        """
-        Change le template de prompt utilisé pour l'extraction.
-
-        Args:
-            template: Nouveau template avec placeholder {text}
-        """
-        if "{text}" not in template:
-            raise ValueError("Le template doit contenir le placeholder {text}")
-        self.prompt_template = template
-
-    def _truncate_ocr(self, text: str) -> str:
-        """Tronque le texte OCR si trop long."""
-        if len(text) > self.max_ocr_chars:
-            return text[:self.max_ocr_chars] + "\n[...] (truncated)"
-        return text
+        raise ValueError(f"Unknown backend: {self.backend}")
 
     def _generate(self, prompt: str) -> str:
-        """
-        Génère du texte avec le modèle chargé.
-
-        Args:
-            prompt: Prompt complet à envoyer au modèle
-
-        Returns:
-            Texte généré brut
-        """
+        """Génère du texte avec le modèle chargé."""
         if self.backend == "mlx":
+            # mlx_lm.generate signature can vary; keep it simple/reliable.
             output = mlx_lm.generate(
                 self.model,
                 self.tokenizer,
                 prompt,
-                max_tokens=self.max_new_tokens
+                max_tokens=self.max_new_tokens,
             )
-            return output.strip()
+            return (output or "").strip()
 
-        elif self.backend == "pytorch":
-            out = self.pipe(prompt)[0]
+        if self.backend == "pytorch":
+            out = self.pipe(
+                prompt,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                do_sample=self.do_sample,
+            )[0]
             return out.get("generated_text") or out.get("text") or ""
+
+        raise ValueError(f"Unknown backend: {self.backend}")
+
+    # =========================================================================
+    # Prompt helpers
+    # =========================================================================
+
+    def set_prompt_template(self, template: str) -> None:
+        """
+        Permet de changer le template de prompt “à la main”.
+        IMPORTANT: recalcule prompt_hash (sinon bug silencieux).
+        """
+        if "{text}" not in template:
+            raise ValueError("Le template doit contenir le placeholder {text}")
+        self.prompt_id = None
+        self.prompt_template = template
+        self.prompt_template_source = "inline_template"
+        self.prompt_hash = _sha256(self.prompt_template + self.prompt_suffix)
+
+    def _truncate_ocr(self, text: str) -> str:
+        """Tronque le texte OCR si trop long (évite prompts gigantesques)."""
+        if len(text) > self.max_ocr_chars:
+            return text[: self.max_ocr_chars] + "\n[...] (truncated)"
+        return text
+
+    # =========================================================================
+    # Parsing / normalization
+    # =========================================================================
 
     def _extract_json(self, text: str) -> str:
         """
         Extrait le premier bloc JSON valide du texte généré.
 
-        Args:
-            text: Texte brut du modèle
-
-        Returns:
-            Chaîne JSON extraite (ou "{}" si échec)
+        Stratégie:
+        1) trouver un bloc {...} équilibré (regex récursive)
+        2) fallback sur une extraction partielle à partir de "identifier"
+        3) sinon {} (échec)
         """
-        # Recherche du bloc {...} complet
-        m = re.search(r'\{(?:[^{}]|(?R))*\}', text, re.DOTALL)
+        m = re.search(r"\{(?:[^{}]|(?R))*\}", text, re.DOTALL)
         if m:
             return m.group(0)
 
-        # Fallback: recherche partielle à partir de "identifier"
         alt = re.search(r'"identifier".*', text, re.DOTALL)
         if alt:
             raw = alt.group(0).strip()
@@ -180,37 +269,22 @@ class PatentExtractor:
         return "{}"
 
     def _normalize_entity_list(self, value):
-        """
-        Normalise une liste d'entités (inventeurs/assignees).
-
-        Accepte:
-        - Liste de dicts [{"name": ..., "address": ...}]
-        - String "Jean Dupont (Paris); Marie Curie (Versailles)"
-
-        Returns:
-            Liste de dicts normalisés ou None
-        """
+        """Normalise inventors/assignees."""
         if value is None:
             return None
 
-        # Déjà au bon format
         if isinstance(value, list) and all(isinstance(x, dict) for x in value):
             return value
 
-        # Parsing depuis string
         if isinstance(value, str):
             entities = []
             for chunk in value.split(";"):
                 chunk = chunk.strip()
                 if not chunk:
                     continue
-                # Extraction "Nom (Ville)"
                 m = re.match(r"(.+?)\s*\(([^)]+)\)", chunk)
                 if m:
-                    entities.append({
-                        "name": m.group(1).strip(),
-                        "address": m.group(2).strip()
-                    })
+                    entities.append({"name": m.group(1).strip(), "address": m.group(2).strip()})
                 else:
                     entities.append({"name": chunk, "address": None})
             return entities if entities else None
@@ -218,162 +292,89 @@ class PatentExtractor:
         return None
 
     def _is_company_name(self, name: str) -> bool:
-        """
-        Détecte si un nom est probablement une entreprise.
-
-        Indices :
-        - Contient &, und, et
-        - Contient GmbH, AG, SA, Co., KG, Ltd, Inc
-        - Tout en majuscules (>= 50% de lettres majuscules)
-
-        Args:
-            name: Nom à analyser
-
-        Returns:
-            True si c'est probablement une entreprise
-        """
+        """Heuristique: détecte si un nom ressemble à une entreprise."""
         if not name:
             return False
 
         name_lower = name.lower()
-
-        # Patterns évidents de compagnies
         company_patterns = [
-            r'\&',  # &
-            r'\bund\b',  # und
-            r'\bet\b',  # et
-            r'\bgmbh\b',
-            r'\bag\b',
-            r'\bsa\b',
-            r'\bco\.',
-            r'\bkg\b',
-            r'\bltd\b',
-            r'\binc\b',
-            r'\bcorp\b',
-            r'\bs\.a\.',
-            r'\bs\.r\.l\.',
+            r"\&",
+            r"\bund\b",
+            r"\bet\b",
+            r"\bgmbh\b",
+            r"\bag\b",
+            r"\bsa\b",
+            r"\bco\.",
+            r"\bkg\b",
+            r"\bltd\b",
+            r"\binc\b",
+            r"\bcorp\b",
+            r"\bs\.a\.",
+            r"\bs\.r\.l\.",
         ]
-
-        for pattern in company_patterns:
-            if re.search(pattern, name_lower):
+        for pat in company_patterns:
+            if re.search(pat, name_lower):
                 return True
 
-        # Heuristique : beaucoup de majuscules = entreprise
         letters = [c for c in name if c.isalpha()]
         if letters:
             upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
-            if upper_ratio > 0.6:  # Plus de 60% de majuscules
+            if upper_ratio > 0.6:
                 return True
 
         return False
 
     def _fix_inventor_assignee_confusion(self, data: dict) -> dict:
-        """
-        Corrige automatiquement les confusions inventors/assignees.
-
-        Si des noms d'entreprise sont dans inventors, les déplace vers assignees.
-
-        Args:
-            data: Dict avec champs inventors et assignees
-
-        Returns:
-            Dict corrigé
-        """
+        """Si des entreprises apparaissent dans inventors, les déplacer vers assignees."""
         inventors = data.get("inventors") or []
         assignees = data.get("assignees") or []
 
         if not inventors:
             return data
 
-        # Séparer vrais inventors et companies mal placées
         true_inventors = []
         misplaced_companies = []
 
-        for inventor in inventors:
-            if isinstance(inventor, dict):
-                name = inventor.get("name", "")
+        for inv in inventors:
+            if isinstance(inv, dict):
+                name = inv.get("name", "")
                 if self._is_company_name(name):
-                    misplaced_companies.append(inventor)
+                    misplaced_companies.append(inv)
                 else:
-                    true_inventors.append(inventor)
+                    true_inventors.append(inv)
 
-        # Si on a trouvé des compagnies mal placées
         if misplaced_companies:
             print(f"🔧 Correction : {len(misplaced_companies)} entreprise(s) déplacée(s) vers assignees")
-            for company in misplaced_companies:
-                print(f"   → {company.get('name')}")
-
-            # Fusionner avec les assignees existants
-            all_assignees = assignees + misplaced_companies
-
             data["inventors"] = true_inventors if true_inventors else None
-            data["assignees"] = all_assignees if all_assignees else None
+            data["assignees"] = (assignees + misplaced_companies) or None
 
         return data
 
     def _fix_duplicate_dates(self, data: dict) -> dict:
-        """
-        Corrige les dates dupliquées.
-
-        Si pub_date_application == pub_date_publication et qu'il n'y a pas de foreign date,
-        on assume que c'est la date de publication, pas d'application.
-
-        Logique :
-        - Si les 3 dates sont identiques → garder seulement publication
-        - Si application == publication (mais ≠ foreign) → mettre application à None
-        - Si une seule date existe → c'est probablement la publication
-
-        Args:
-            data: Dict avec champs de dates
-
-        Returns:
-            Dict corrigé
-        """
+        """Corrige des dates dupliquées (heuristique pragmatique)."""
         app_date = data.get("pub_date_application")
         pub_date = data.get("pub_date_publication")
         foreign_date = data.get("pub_date_foreign")
 
-        # Cas 1 : Application == Publication (duplication probable)
         if app_date and pub_date and app_date == pub_date:
-            # Si foreign est différent, on garde les 3
-            if foreign_date and foreign_date != app_date:
-                print(f"🔧 Correction dates : application et publication identiques ({app_date})")
-                print(f"   → Interprétation : {app_date} = publication (car foreign={foreign_date} existe)")
-                data["pub_date_application"] = None
-            else:
-                # Pas de foreign ou foreign identique aussi → c'est juste la publication
-                print(f"🔧 Correction dates : une seule date trouvée ({app_date})")
-                print(f"   → Interprétation : {app_date} = date de publication")
-                data["pub_date_application"] = None
+            data["pub_date_application"] = None
 
-        # Cas 2 : Les 3 dates identiques (très improbable)
         if app_date and pub_date and foreign_date and app_date == pub_date == foreign_date:
-            print(f"🔧 Correction dates : 3 dates identiques ({app_date})")
-            print(f"   → Garde seulement publication")
             data["pub_date_application"] = None
             data["pub_date_foreign"] = None
 
         return data
 
     def _parse_and_validate(self, json_str: str) -> PatentMetadata:
-        """
-        Parse le JSON et valide avec Pydantic.
-
-        Args:
-            json_str: Chaîne JSON brute
-
-        Returns:
-            PatentMetadata validé
-        """
+        """Parse le JSON et valide avec Pydantic."""
         try:
             data = json.loads(json_str)
 
-            # Gestion des types inattendus
             if not isinstance(data, dict):
                 print(f"⚠️ JSON type inattendu: {type(data)}")
                 data = data[0] if isinstance(data, list) and data else {}
 
-            # Rétrocompatibilité des noms de champs
+            # rétrocompatibilité (noms de champs)
             if "assignee" in data and "assignees" not in data:
                 data["assignees"] = data.pop("assignee")
             if "inventor" in data and "inventors" not in data:
@@ -381,23 +382,26 @@ class PatentExtractor:
             if "class" in data and "classification" not in data:
                 data["classification"] = data.pop("class")
 
-            # Initialisation des champs requis
+            # champs requis (même si null)
             required_fields = [
-                "title", "inventors", "assignees",
-                "pub_date_application", "pub_date_publication", "pub_date_foreign",
-                "classification", "industrial_field"
+                "title",
+                "inventors",
+                "assignees",
+                "pub_date_application",
+                "pub_date_publication",
+                "pub_date_foreign",
+                "classification",
+                "industrial_field",
             ]
-            for key in required_fields:
-                data.setdefault(key, None)
+            for k in required_fields:
+                data.setdefault(k, None)
 
-            # Normalisation des listes
+            # normalisation inventors/assignees
             data["inventors"] = self._normalize_entity_list(data.get("inventors"))
             data["assignees"] = self._normalize_entity_list(data.get("assignees"))
 
-            # 🔧 CORRECTION AUTOMATIQUE : déplacer les entreprises mal classées
+            # corrections heuristiques
             data = self._fix_inventor_assignee_confusion(data)
-
-            # 🔧 CORRECTION AUTOMATIQUE : gérer les dates dupliquées
             data = self._fix_duplicate_dates(data)
 
             return PatentMetadata(**data)
@@ -407,23 +411,27 @@ class PatentExtractor:
             print(f"→ JSON brut:\n{json_str}\n")
             return PatentMetadata(identifier="unknown")
 
+    # =========================================================================
+    # Extraction (with timings)
+    # =========================================================================
+
     def extract(self, ocr_text: str, debug: bool = False) -> PatentExtraction:
         """
         Extrait les métadonnées structurées d'un texte OCR.
 
-        Args:
-            ocr_text: Texte brut issu de l'OCR
-            debug: Si True, affiche le prompt complet et la sortie brute
-
-        Returns:
-            PatentExtraction avec metadata Pydantic validé
+        Timings:
+        - basic: t_generate_s, t_total_s
+        - detailed: + t_prompt_s, t_parse_s
         """
-        # Troncature si nécessaire
+        t0 = time.perf_counter() if self.timings != "off" else None
+
+        # 1) Troncature OCR
         truncated_text = self._truncate_ocr(ocr_text)
 
-        # Construction du prompt
-        prompt = self.prompt_template.format(text=truncated_text)
-        prompt += "\n\nNow output ONLY the JSON object, without any extra text.\n"
+        # 2) Construction du prompt
+        t_prompt0 = time.perf_counter() if self.timings == "detailed" else None
+        prompt = self.prompt_template.format(text=truncated_text) + self.prompt_suffix
+        t_prompt1 = time.perf_counter() if self.timings == "detailed" else None
 
         if debug:
             print("=" * 80)
@@ -432,8 +440,10 @@ class PatentExtractor:
             print(prompt)
             print("=" * 80)
 
-        # Génération
+        # 3) Génération
+        t_gen0 = time.perf_counter() if self.timings != "off" else None
         raw_output = self._generate(prompt)
+        t_gen1 = time.perf_counter() if self.timings != "off" else None
 
         if debug:
             print("\n" + "=" * 80)
@@ -442,7 +452,8 @@ class PatentExtractor:
             print(raw_output)
             print("=" * 80)
 
-        # Extraction et parsing JSON
+        # 4) Parsing JSON + validation Pydantic
+        t_parse0 = time.perf_counter() if self.timings == "detailed" else None
         json_str = self._extract_json(raw_output)
 
         if debug:
@@ -453,68 +464,147 @@ class PatentExtractor:
             print("=" * 80 + "\n")
 
         metadata = self._parse_and_validate(json_str)
+        t_parse1 = time.perf_counter() if self.timings == "detailed" else None
+
+        # 5) Timings dict (persistable)
+        t_end = time.perf_counter() if self.timings != "off" else None
+        self._last_timing = self._timing_dict(
+            t0=t0,
+            t_prompt0=t_prompt0,
+            t_prompt1=t_prompt1,
+            t_gen0=t_gen0,
+            t_gen1=t_gen1,
+            t_parse0=t_parse0,
+            t_parse1=t_parse1,
+            t_end=t_end,
+        )
 
         return PatentExtraction(
             ocr_text=ocr_text,
             model=self.model_name,
-            prediction=metadata
+            prediction=metadata,
         )
+
+    def _timing_dict(
+        self,
+        *,
+        t0: Optional[float],
+        t_prompt0: Optional[float],
+        t_prompt1: Optional[float],
+        t_gen0: Optional[float],
+        t_gen1: Optional[float],
+        t_parse0: Optional[float],
+        t_parse1: Optional[float],
+        t_end: Optional[float],
+    ) -> Optional[Dict[str, float]]:
+        if self.timings == "off" or t0 is None or t_end is None:
+            return None
+
+        out: Dict[str, float] = {}
+        out["t_total_s"] = max(0.0, t_end - t0)
+
+        if t_gen0 is not None and t_gen1 is not None:
+            out["t_generate_s"] = max(0.0, t_gen1 - t_gen0)
+
+        if self.timings == "detailed":
+            if t_prompt0 is not None and t_prompt1 is not None:
+                out["t_prompt_s"] = max(0.0, t_prompt1 - t_prompt0)
+            if t_parse0 is not None and t_parse1 is not None:
+                out["t_parse_s"] = max(0.0, t_parse1 - t_parse0)
+
+        return out
+
+    # =========================================================================
+    # File-level wrapper (JSONL record)
+    # =========================================================================
 
     def extract_from_file(self, txt_path: Path) -> dict:
         """
         Extrait les métadonnées d'un fichier .txt.
 
-        Args:
-            txt_path: Chemin vers le fichier OCR .txt
-
         Returns:
-            Dict sérialisable en JSON (prêt pour JSONL)
+            Dict sérialisable en JSON (prêt pour JSONL).
+            Ajoute prompt_id/prompt_hash et timing si dispo.
         """
+        t_file0 = time.perf_counter() if self.timings != "off" else None
+
         try:
-            ocr_text = txt_path.read_text(encoding="utf-8")
+            # Lecture OCR
+            t_read0 = time.perf_counter() if self.timings == "detailed" else None
+            ocr_text = txt_path.read_text(encoding="utf-8", errors="ignore")
+            t_read1 = time.perf_counter() if self.timings == "detailed" else None
 
             if not ocr_text.strip():
-                return {
-                    "file_name": txt_path.name,
-                    "ocr_path": str(txt_path),
-                    "error": "empty_ocr"
-                }
+                rec = {"file_name": txt_path.name, "ocr_path": str(txt_path), "error": "empty_ocr"}
+                if self.prompt_id is not None:
+                    rec["prompt_id"] = self.prompt_id
+                rec["prompt_hash"] = self.prompt_hash
 
+                if self.timings != "off" and t_file0 is not None:
+                    timing = {"t_total_file_s": time.perf_counter() - t_file0}
+                    if self.timings == "detailed" and t_read0 is not None and t_read1 is not None:
+                        timing["t_read_s"] = max(0.0, t_read1 - t_read0)
+                    rec["timing"] = timing
+
+                return rec
+
+            # Extraction LLM
             extraction = self.extract(ocr_text)
             record = extraction.model_dump(mode="json")
+
+            # Champs utiles pour le bench
             record["file_name"] = txt_path.name
             record["ocr_path"] = str(txt_path)
 
-            # Extraction de l'identifier depuis le nom du fichier
-            record["prediction"]["identifier"] = txt_path.stem.split("_")[0]
+            # Identifier depuis le nom de fichier
+            if isinstance(record.get("prediction"), dict):
+                record["prediction"]["identifier"] = txt_path.stem.split("_")[0]
+
+            # Dimensions de benchmark
+            if self.prompt_id is not None:
+                record["prompt_id"] = self.prompt_id
+            record["prompt_hash"] = self.prompt_hash
+
+            # Timings
+            if self.timings != "off":
+                timing_out: Dict[str, float] = {}
+                if self.timings == "detailed" and t_read0 is not None and t_read1 is not None:
+                    timing_out["t_read_s"] = max(0.0, t_read1 - t_read0)
+
+                if self._last_timing:
+                    timing_out.update(self._last_timing)
+
+                if t_file0 is not None:
+                    timing_out["t_total_file_s"] = max(0.0, time.perf_counter() - t_file0)
+
+                record["timing"] = timing_out
 
             return record
 
         except Exception as e:
             print(f"⚠️ Erreur sur {txt_path.name}: {e}")
             traceback.print_exc()
-            return {
-                "file_name": txt_path.name,
-                "ocr_path": str(txt_path),
-                "error": f"exception: {e.__class__.__name__}"
-            }
 
-    def batch_extract(
-        self,
-        txt_dir: Path,
-        out_file: Path,
-        limit: Optional[int] = None
-    ) -> int:
+            rec = {"file_name": txt_path.name, "ocr_path": str(txt_path), "error": f"exception: {e.__class__.__name__}"}
+            if self.prompt_id is not None:
+                rec["prompt_id"] = self.prompt_id
+            rec["prompt_hash"] = self.prompt_hash
+
+            if self.timings != "off" and t_file0 is not None:
+                rec["timing"] = {"t_total_file_s": max(0.0, time.perf_counter() - t_file0)}
+
+            return rec
+
+    # =========================================================================
+    # Batch runner
+    # =========================================================================
+
+    def batch_extract(self, txt_dir: Path, out_file: Path, limit: Optional[int] = None) -> int:
         """
         Traite un dossier de fichiers .txt en batch.
 
-        Args:
-            txt_dir: Dossier contenant les fichiers .txt
-            out_file: Fichier JSONL de sortie
-            limit: Nombre max de fichiers à traiter (None = tous)
-
         Returns:
-            Nombre de documents traités avec succès
+            nombre de documents traités
         """
         txt_files = sorted(txt_dir.glob("*.txt"))
         total = len(txt_files)
@@ -530,12 +620,9 @@ class PatentExtractor:
 
         with open(out_file, "w", encoding="utf-8") as f_out:
             for txt_path in tqdm(txt_files, desc="🧠 Batch extraction", unit="doc"):
-                try:
-                    record = self.extract_from_file(txt_path)
-                    f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    count += 1
-                except Exception as e:
-                    print(f"⚠️ Erreur sur {txt_path.name}: {e}")
+                record = self.extract_from_file(txt_path)
+                f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                count += 1
 
         print(f"✅ Extraction complète → {count} documents traités")
         print(f"📊 Résultats: {out_file}")

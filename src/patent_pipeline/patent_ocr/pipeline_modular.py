@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Union, Literal
 import csv
 import traceback
+import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 
@@ -126,6 +127,7 @@ class OcrEngineBackend:
 # Config / results
 # -----------------------
 SegmentationMode = Literal["custom", "backend"]
+TimingsMode = Literal["off", "basic", "detailed"]
 
 
 @dataclass
@@ -156,6 +158,12 @@ class PipelineOCRConfig:
     keep_empty_docs: bool = True
     join_with: str = "\n\n"
 
+    # Timings:
+    #  - "off": no timing measurements
+    #  - "basic": measure only t_total_s and t_ocr_s
+    #  - "detailed": measure load/deskew/segment/ocr/write/total
+    timings: TimingsMode = "off"
+
 
 @dataclass
 class DocumentReport:
@@ -166,6 +174,14 @@ class DocumentReport:
     deskew_angle: float
     out_txt: str
     error: str = ""
+
+    # Timings (seconds). Always present in CSV for stable schema.
+    t_load_s: float = 0.0
+    t_deskew_s: float = 0.0
+    t_segment_s: float = 0.0
+    t_ocr_s: float = 0.0
+    t_write_s: float = 0.0
+    t_total_s: float = 0.0
 
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".pdf"}
@@ -183,7 +199,22 @@ def write_report_csv(path: Path, rows: List[DocumentReport]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["file_name", "status", "n_blocks", "n_blocks_kept", "deskew_angle", "out_txt", "error"],
+            fieldnames=[
+                "file_name",
+                "status",
+                "n_blocks",
+                "n_blocks_kept",
+                "deskew_angle",
+                "out_txt",
+                "error",
+                # timings
+                "t_load_s",
+                "t_deskew_s",
+                "t_segment_s",
+                "t_ocr_s",
+                "t_write_s",
+                "t_total_s",
+            ],
         )
         w.writeheader()
         for r in rows:
@@ -196,6 +227,12 @@ def write_report_csv(path: Path, rows: List[DocumentReport]) -> None:
                     "deskew_angle": f"{r.deskew_angle:.4f}",
                     "out_txt": r.out_txt,
                     "error": r.error,
+                    "t_load_s": f"{r.t_load_s:.6f}",
+                    "t_deskew_s": f"{r.t_deskew_s:.6f}",
+                    "t_segment_s": f"{r.t_segment_s:.6f}",
+                    "t_ocr_s": f"{r.t_ocr_s:.6f}",
+                    "t_write_s": f"{r.t_write_s:.6f}",
+                    "t_total_s": f"{r.t_total_s:.6f}",
                 }
             )
 
@@ -286,6 +323,14 @@ class Pipeline_OCR:
     def _process_one(self, doc_path: Path, cfg: PipelineOCRConfig) -> DocumentReport:
         out_txt_path = cfg.out_dir / f"{doc_path.stem}.txt"
 
+        timings_mode: TimingsMode = getattr(cfg, "timings", "off")
+        want_basic = timings_mode in ("basic", "detailed")
+        want_detailed = timings_mode == "detailed"
+
+        # timers (seconds)
+        t_load_s = t_deskew_s = t_segment_s = t_ocr_s = t_write_s = t_total_s = 0.0
+        t0_total = time.perf_counter() if want_basic else 0.0
+
         # Skip if exists (unless force)
         if out_txt_path.exists() and not cfg.force:
             return DocumentReport(
@@ -295,23 +340,44 @@ class Pipeline_OCR:
                 n_blocks_kept=0,
                 deskew_angle=0.0,
                 out_txt=str(out_txt_path),
+                t_load_s=t_load_s,
+                t_deskew_s=t_deskew_s,
+                t_segment_s=t_segment_s,
+                t_ocr_s=t_ocr_s,
+                t_write_s=t_write_s,
+                t_total_s=t_total_s,
             )
 
         try:
             # ------------------------------------------------------------
             # 1) Load page (PIL RGB)
             # ------------------------------------------------------------
-            page_img = load_page_as_pil(doc_path)
+            if want_detailed:
+                t0 = time.perf_counter()
+                page_img = load_page_as_pil(doc_path)
+                t_load_s = time.perf_counter() - t0
+            else:
+                page_img = load_page_as_pil(doc_path)
 
             # ------------------------------------------------------------
             # 2) Deskew ONCE (page-level)
             # ------------------------------------------------------------
-            page_img, deskew_angle = deskew_page_if_needed(
-                page_img,
-                deskewer=self.deskewer,
-                max_angle=cfg.deskew_max_angle,
-                enabled=cfg.deskew,
-            )
+            if want_detailed:
+                t0 = time.perf_counter()
+                page_img, deskew_angle = deskew_page_if_needed(
+                    page_img,
+                    deskewer=self.deskewer,
+                    max_angle=cfg.deskew_max_angle,
+                    enabled=cfg.deskew,
+                )
+                t_deskew_s = time.perf_counter() - t0
+            else:
+                page_img, deskew_angle = deskew_page_if_needed(
+                    page_img,
+                    deskewer=self.deskewer,
+                    max_angle=cfg.deskew_max_angle,
+                    enabled=cfg.deskew,
+                )
 
             # ------------------------------------------------------------
             # 3) Segmentation strategy
@@ -322,12 +388,22 @@ class Pipeline_OCR:
 
                 # IMPORTANT: pipeline already deskewed the page
                 # -> we explicitly disable deskew inside the segmenter
-                res = self.segmenter.process(
-                    page_img,
-                    deskew=False,
-                    deskew_max_angle=cfg.deskew_max_angle,
-                    return_debug=False,
-                )
+                if want_detailed:
+                    t0 = time.perf_counter()
+                    res = self.segmenter.process(
+                        page_img,
+                        deskew=False,
+                        deskew_max_angle=cfg.deskew_max_angle,
+                        return_debug=False,
+                    )
+                    t_segment_s = time.perf_counter() - t0
+                else:
+                    res = self.segmenter.process(
+                        page_img,
+                        deskew=False,
+                        deskew_max_angle=cfg.deskew_max_angle,
+                        return_debug=False,
+                    )
 
                 # We trust our deskewed page as source of truth
                 page_img = res.get("image", page_img)
@@ -343,13 +419,22 @@ class Pipeline_OCR:
                 boxes = [[0, 0, w, h]]
                 block_imgs = [page_img]
 
+                # Detailed timings: segmentation is basically a no-op
+                if want_detailed:
+                    t_segment_s = 0.0
+
             else:
                 raise ValueError(f"Unknown segmentation_mode: {cfg.segmentation_mode!r}")
 
             # ------------------------------------------------------------
             # 4) OCR in ONE unified call (STRICT)
             # ------------------------------------------------------------
-            texts: List[str] = self.ocr_backend.run_blocks_ocr(block_imgs, cfg.ocr_config)
+            if want_basic:
+                t0 = time.perf_counter()
+                texts: List[str] = self.ocr_backend.run_blocks_ocr(block_imgs, cfg.ocr_config)
+                t_ocr_s = time.perf_counter() - t0
+            else:
+                texts = self.ocr_backend.run_blocks_ocr(block_imgs, cfg.ocr_config)
             if len(texts) != len(block_imgs):
                 raise ValueError(
                     f"OCR backend returned {len(texts)} results for {len(block_imgs)} blocks "
@@ -375,8 +460,17 @@ class Pipeline_OCR:
             # 6) Write output
             # ------------------------------------------------------------
             cfg.out_dir.mkdir(parents=True, exist_ok=True)
-            if full_text or cfg.keep_empty_docs:
-                out_txt_path.write_text(full_text, encoding="utf-8")
+            if want_detailed:
+                t0 = time.perf_counter()
+                if full_text or cfg.keep_empty_docs:
+                    out_txt_path.write_text(full_text, encoding="utf-8")
+                t_write_s = time.perf_counter() - t0
+            else:
+                if full_text or cfg.keep_empty_docs:
+                    out_txt_path.write_text(full_text, encoding="utf-8")
+
+            if want_basic:
+                t_total_s = time.perf_counter() - t0_total
 
             status = "ok" if full_text else "empty"
             return DocumentReport(
@@ -386,12 +480,21 @@ class Pipeline_OCR:
                 n_blocks_kept=kept,
                 deskew_angle=deskew_angle,
                 out_txt=str(out_txt_path),
+                t_load_s=t_load_s,
+                t_deskew_s=t_deskew_s,
+                t_segment_s=t_segment_s,
+                t_ocr_s=t_ocr_s,
+                t_write_s=t_write_s,
+                t_total_s=t_total_s,
             )
 
         except Exception as e:
             cfg.out_dir.mkdir(parents=True, exist_ok=True)
             if cfg.keep_empty_docs:
                 out_txt_path.write_text("", encoding="utf-8")
+
+            if want_basic:
+                t_total_s = time.perf_counter() - t0_total
 
             return DocumentReport(
                 file_name=str(doc_path),
@@ -401,6 +504,12 @@ class Pipeline_OCR:
                 deskew_angle=0.0,
                 out_txt=str(out_txt_path),
                 error="".join(traceback.format_exception_only(type(e), e)).strip(),
+                t_load_s=t_load_s,
+                t_deskew_s=t_deskew_s,
+                t_segment_s=t_segment_s,
+                t_ocr_s=t_ocr_s,
+                t_write_s=t_write_s,
+                t_total_s=t_total_s,
             )
 
     def run(self, cfg: PipelineOCRConfig) -> List[DocumentReport]:
