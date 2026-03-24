@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
-from typing import Any, Dict, List
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple
 
 from PIL import Image
 
-from doctr.io import DocumentFile
-from doctr.models import ocr_predictor
+import torch
 
+from patent_pipeline.patent_ocr.backends.deps import DOCTR_DEPS, import_module_with_auto_install
 from patent_pipeline.patent_ocr.utils.image_preprocess import preprocess_pil
 
 
@@ -78,22 +78,71 @@ class DocTROcrBackend:
     det_arch: str = "db_resnet50"
     reco_arch: str = "crnn_vgg16_bn"
     pretrained: bool = True
-    device: str = "cpu"
+    device: str = "cuda"
     name_: str = "doctr"
+    auto_install_deps: bool = False
+
+    # Internals populated lazily
+    _document_file_cls: Any = field(init=False, repr=False)
+
+    def _load_doctr_modules(self) -> Tuple[Any, Any]:
+        doc_module = import_module_with_auto_install(
+            module_name="doctr.io",
+            backend_name="DocTR",
+            deps=DOCTR_DEPS,
+            auto_install=self.auto_install_deps,
+            err_hint="DocTR backend requires python-doctr[torch] to run.",
+        )
+        models_module = import_module_with_auto_install(
+            module_name="doctr.models",
+            backend_name="DocTR",
+            deps=DOCTR_DEPS,
+            auto_install=self.auto_install_deps,
+            err_hint="DocTR backend requires python-doctr[torch] to run.",
+        )
+
+        DocumentFile = getattr(doc_module, "DocumentFile")
+        predictor_cls = getattr(models_module, "ocr_predictor")
+        return DocumentFile, predictor_cls
 
     def __post_init__(self) -> None:
-        self.device = (self.device or "cpu").lower().strip()
+        req = (self.device or "auto").lower().strip()
 
-        self.model = ocr_predictor(
+        DocumentFile, predictor_cls = self._load_doctr_modules()
+        self._document_file_cls = DocumentFile
+
+        self.model = predictor_cls(
             det_arch=self.det_arch,
             reco_arch=self.reco_arch,
             pretrained=self.pretrained,
         )
 
+        cuda_ok = torch.cuda.is_available()
+        mps_ok = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+        # Resolve device
+        if req in {"auto", "gpu"}:
+            if cuda_ok:
+                self.device = "cuda"
+            elif mps_ok:
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = req
+
+        # Apply + safe fallback
         if self.device == "cuda":
-            self.model = self.model.cuda()
+            if not cuda_ok:
+                self.device = "cpu"
+            else:
+                self.model = self.model.to("cuda")
         elif self.device == "mps":
-            self.model = self.model.to("mps")
+            if not mps_ok:
+                self.device = "cpu"
+            else:
+                self.model = self.model.to("mps")
+        # cpu -> no-op
 
         self.model.eval()
 
@@ -130,7 +179,7 @@ class DocTROcrBackend:
             pil = preprocess_pil(pil, mode=preprocess_mode)
             files.append(_pil_to_png_bytes(pil))
 
-        doc = DocumentFile.from_images(files)
+        doc = self._document_file_cls.from_images(files)
         result = self.model(doc)
 
         texts: List[str] = []

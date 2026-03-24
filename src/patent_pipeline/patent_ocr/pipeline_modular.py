@@ -21,7 +21,7 @@ Objectif :
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Union, Literal
+from typing import Any, Callable, Dict, List, Optional, Protocol, Union, Literal
 import csv
 import traceback
 import time
@@ -512,10 +512,16 @@ class Pipeline_OCR:
                 t_total_s=t_total_s,
             )
 
-    def run(self, cfg: PipelineOCRConfig) -> List[DocumentReport]:
+    def run(
+        self,
+        cfg: PipelineOCRConfig,
+        progress_callback: Callable[[DocumentReport, int, int], None] | None = None,
+    ) -> List[DocumentReport]:
         docs = iter_docs(cfg.raw_dir)
         if cfg.limit is not None:
             docs = docs[: int(cfg.limit)]
+
+        total_docs = len(docs)
 
         # ------------------------------------------------------------
         # Parallelism heuristic WITHOUT mutating cfg
@@ -539,6 +545,8 @@ class Pipeline_OCR:
                 r = self._process_one(p, cfg)
                 rows.append(r)
                 print(f" - {p.name}: {r.status} ({r.n_blocks_kept}/{r.n_blocks})")
+                if progress_callback:
+                    progress_callback(r, len(rows), total_docs)
             return rows
 
         Executor = ThreadPoolExecutor if parallel_eff == "threads" else ProcessPoolExecutor
@@ -549,5 +557,7 @@ class Pipeline_OCR:
                 r = fut.result()
                 rows.append(r)
                 print(f" - {Path(r.file_name).name}: {r.status} ({r.n_blocks_kept}/{r.n_blocks})")
+                if progress_callback:
+                    progress_callback(r, len(rows), total_docs)
 
         return rows

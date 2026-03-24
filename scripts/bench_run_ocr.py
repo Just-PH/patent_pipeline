@@ -12,6 +12,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+_REPO_DIR = Path(__file__).resolve().parents[1]
+_SRC_DIR = _REPO_DIR / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from patent_pipeline.patent_ocr.pipeline_modular import PipelineOCRConfig, write_report_csv, iter_docs
+
 def _to_jsonable(x):
     """Recursively convert objects (Path, dataclasses, etc.) into JSON-serializable types."""
     if isinstance(x, Path):
@@ -41,6 +48,19 @@ def _git_info(repo_dir: Path) -> Dict[str, Any]:
         "git_branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
         "git_dirty": bool(run(["git", "status", "--porcelain"])),
     }
+
+
+_TIMINGS_PRIORITY = {
+    "off": 0,
+    "basic": 1,
+    "detailed": 2,
+}
+
+
+def _ensure_timings_at_least(current: str, minimum: str) -> str:
+    if _TIMINGS_PRIORITY.get(current, 0) >= _TIMINGS_PRIORITY.get(minimum, 0):
+        return current
+    return minimum
 
 
 def _import_symbol(spec: str):
@@ -79,9 +99,13 @@ def _default_backend_spec(backend_key: str) -> str:
     """
     m = {
         "tesseract": "patent_pipeline.patent_ocr.backends.tesseract_backend:TesseractBackend",
+        "tesserocr": "patent_pipeline.patent_ocr.backends.tesserocr_backend:TesserocrBackend",
         "doctr": "patent_pipeline.patent_ocr.backends.doctr_backend:DocTROcrBackend",
         "gotocr": "patent_pipeline.patent_ocr.backends.got_ocr_backend:GotOcrBackend",
         "paddle": "patent_pipeline.patent_ocr.backends.paddleocr_backend:PaddleOcrBackend",
+        "lightonocr": "patent_pipeline.patent_ocr.backends.lightonocr_backend:LightOnOcrBackend",
+        "surya": "patent_pipeline.patent_ocr.backends.surya_backend:SuryaOcrBackend",
+
     }
     if backend_key not in m:
         raise ValueError(
@@ -119,7 +143,7 @@ def main():
     parser.add_argument("--out-root", type=Path, required=True, help="Root output directory (will create out-root/run-name/)")
     parser.add_argument("--run-name", type=str, required=True, help="Run folder name (e.g. gotocr_custom_v1)")
     parser.add_argument("--segmentation", type=str, default="custom", choices=["custom", "backend"], help="Segmentation mode for PipelineOCRConfig")
-    parser.add_argument("--backend", type=str, default="gotocr", help="Backend short key (tesseract/doctr/gotocr/paddle)")
+    parser.add_argument("--backend", type=str, default="gotocr", help="Backend short key (tesseract/tesserocr/doctr/gotocr/paddle)")
     parser.add_argument("--backend-import", type=str, default=None, help="Override backend import spec: module:Class")
     parser.add_argument("--backend-kwargs-json", type=str, default="{}", help="JSON kwargs passed to backend constructor")
     parser.add_argument("--ocr-config-json", type=str, default="{}", help="JSON dict passed as cfg.ocr_config")
@@ -139,7 +163,23 @@ def main():
         choices=["off", "basic", "detailed"],
         help="Timing measurements: off|basic (total+ocr)|detailed (load/deskew/segment/ocr/write/total)",
     )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=0,
+        help="Log progress every N docs (requires >=basic timings when activated).",
+    )
+    parser.add_argument(
+        "--auto-install-deps",
+        action="store_true",
+        help="When a backend import fails, automatically pip install its pinned deps (DocTR/LightOnOCR).",
+    )
     args = parser.parse_args()
+
+    log_every = max(0, args.log_every or 0)
+    total_docs = len(iter_docs(args.raw_dir))
+    if args.limit is not None:
+        total_docs = min(total_docs, args.limit)
 
     repo_dir = Path(__file__).resolve().parents[1]  # patent_pipeline/
     _ensure_src_on_path(repo_dir)
@@ -158,10 +198,27 @@ def main():
     elif args.deskew:
         deskew = True
 
+    cfg_timings = args.timings
+    if log_every > 0:
+        desired = _ensure_timings_at_least(args.timings, "basic")
+        if desired != args.timings:
+            print("⚙️  Progress logging requires --timings=basic to capture t_total_s.")
+        cfg_timings = desired
+
     backend_spec = args.backend_import or _default_backend_spec(args.backend)
     BackendCls = _import_symbol(backend_spec)
 
     backend_kwargs = json.loads(args.backend_kwargs_json or "{}")
+    auto_install_supported = {"doctr_backend", "lightonocr_backend"}
+    should_auto_install = False
+    if args.auto_install_deps:
+        if args.backend in {"doctr", "lightonocr"}:
+            should_auto_install = True
+        else:
+            if any(key in backend_spec for key in auto_install_supported):
+                should_auto_install = True
+    if should_auto_install:
+        backend_kwargs.setdefault("auto_install_deps", True)
     ocr_config = json.loads(args.ocr_config_json or "{}")
 
     # Instantiate backend
@@ -174,8 +231,6 @@ def main():
         ) from e
 
     pipeline, deskewer = _build_pipeline(args.segmentation, backend_obj, deskew_method=args.deskew_method)
-
-    from patent_pipeline.patent_ocr.pipeline_modular import PipelineOCRConfig, write_report_csv
 
     cfg = PipelineOCRConfig(
         raw_dir=args.raw_dir,
@@ -190,7 +245,7 @@ def main():
         limit=args.limit,
         force=args.force,
         keep_empty_docs=args.keep_empty_docs,
-        timings=args.timings,
+        timings=cfg_timings,
     )
 
     # Save run.json (metadata + full config)
@@ -208,6 +263,10 @@ def main():
         "report_file": str(report_file),
         "segmentation": args.segmentation,
         "timings": args.timings,
+        "timings_used": cfg_timings,
+        "log_every": log_every,
+        "auto_install_deps": args.auto_install_deps,
+        "total_docs": total_docs,
         "backend_spec": backend_spec,
         "backend_kwargs": backend_kwargs,
         "ocr_config": ocr_config,
@@ -219,8 +278,21 @@ def main():
     }
     run_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    progress_callback = None
+    if log_every > 0 and total_docs > 0:
+        progress_state = {"sum": 0.0}
+
+        def _progress_cb(report, count, total):
+            progress_state["sum"] += max(report.t_total_s, 0.0)
+            if (count % log_every == 0) or (count == total):
+                avg = progress_state["sum"] / count if count else 0.0
+                doc_name = Path(report.file_name).name if report.file_name else "<unknown>"
+                print(f"[OCR] doc {count}/{total} ({doc_name}) avg {avg:.2f}s")
+
+        progress_callback = _progress_cb
+
     # Run
-    rows = pipeline.run(cfg)
+    rows = pipeline.run(cfg, progress_callback=progress_callback)
     write_report_csv(report_file, rows)
 
     print("✅ OCR done")

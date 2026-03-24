@@ -1,0 +1,7 @@
+lang,expected,found,present,missing,extra,notes
+GB,2186640,591848,555213,1631427,36635,from recovered archive scan
+DE,2076500,1293481,,1205993,422974,
+DD,155709,197387,,3728,45406,
+CH,706403,423915,,288282,5794,
+US,9767076,3074332,,9767076,3074332,values as reported; missing equals expected
+BG,,,,,,no output found in notebook

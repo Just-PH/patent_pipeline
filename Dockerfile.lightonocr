@@ -1,0 +1,74 @@
+# CUDA 12.1 runtime
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    HF_HOME=/data/cache/huggingface \
+    TRANSFORMERS_CACHE=/data/cache/huggingface \
+    HF_HUB_CACHE=/data/cache/huggingface \
+    TORCH_HOME=/data/cache/torch
+
+WORKDIR /app
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git \
+    python3 python3-pip \
+    libgomp1 \
+    libgl1 libglib2.0-0 \
+    poppler-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python && ln -sf /usr/bin/pip3 /usr/bin/pip
+
+# Pip base
+RUN python -m pip install --no-cache-dir -U pip setuptools wheel
+
+# Numpy pin (si tu l’avais pour compat)
+RUN python -m pip install --no-cache-dir "numpy<2.0"
+
+# Torch CUDA 12.1 wheels (pinned to avoid torch/torchvision mismatches)
+RUN python -m pip install --no-cache-dir \
+    "torch==2.5.1+cu121" "torchvision==0.20.1+cu121" "torchaudio==2.5.1+cu121" \
+    --index-url https://download.pytorch.org/whl/cu121
+
+RUN python - <<'PY'
+import torch
+print("✓ Torch:", torch.__version__)
+print("✓ CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("✓ CUDA:", torch.version.cuda)
+PY
+
+# Minimal project deps needed by lightonocr backend + pipeline
+RUN python -m pip install --no-cache-dir \
+    "pydantic>=2.12.3,<3.0.0" \
+    "tqdm>=4.67.1,<5.0.0" \
+    "loguru>=0.7.3,<0.8.0" \
+    "pillow>=10.2.0,<11.0.0" \
+    "pdf2image>=1.17.0,<2.0.0" \
+    "opencv-python-headless>=4.10.0,<5.0.0" \
+    "langdetect>=1.0.9,<2.0.0" \
+    "accelerate>=1.0.0,<2.0.0" \
+    "sentencepiece>=0.2.1,<0.3.0" \
+    "regex>=2024.0.0,<2026.0.0" \
+    "safetensors" \
+    "pypdfium2>=4.30.0,<5.0.0"
+
+# ✅ IMPORTANT: LightOnOCR-2 via Transformers (version git pour compat)
+RUN python -m pip install --no-cache-dir \
+    "git+https://github.com/huggingface/transformers.git"
+
+# Quick import check
+RUN python - <<'PY'
+from transformers import LightOnOcrForConditionalGeneration, LightOnOcrProcessor
+print("✓ LightOn classes OK")
+PY
+
+COPY src /app/src
+COPY scripts /app/scripts
+# Ton entrypoint (à adapter si tu veux)
+CMD ["bash"]

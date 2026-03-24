@@ -172,6 +172,29 @@ bash scripts/run_azure.sh
 
 ---
 
+## ⚡ LightOnOCR GPU Batching
+
+For `lightonocr` backend, pipeline GPU mode keeps `workers=1` by design.  
+To scale throughput, increase `ocr_config.batch_size` (backend-side batching).
+
+Example with `bench_run_ocr.py`:
+
+```bash
+python -u scripts/bench_run_ocr.py \
+  --raw-dir /work/input/gold_standard_DE/PNGs_extracted \
+  --out-root /work/patent-ocr-bench/output_vm/ocr \
+  --run-name lightonocr_backend_b4 \
+  --backend lightonocr \
+  --segmentation backend \
+  --workers 1 \
+  --parallel none \
+  --timings detailed \
+  --limit 100 \
+  --ocr-config-json '{"batch_size":4,"max_new_tokens":4096,"resize_longest_edge":1540,"temperature":0.0,"do_sample":false}'
+```
+
+---
+
 ## 🧾 License
 
 Distributed under the **MIT License**.

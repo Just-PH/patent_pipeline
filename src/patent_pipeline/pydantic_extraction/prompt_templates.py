@@ -33,7 +33,7 @@ Self-check before final output:
 - Ensure pub_date_foreign is not later than pub_date_application (if both exist). If it is later, re-check or set pub_date_foreign = null.
 
 
-Beispielausgabe 1:
+Example 1:
 {{
   "title": "Dispositif de chauffage solaire à collecteurs modulaires",
   "inventors": [
@@ -49,7 +49,7 @@ Beispielausgabe 1:
   "classification": "15b",
   "industrial_field": "Erneuerbare Energiesysteme"
 }}
-Beispielausgabe 2:
+Example 2:
 {{
   "title": "Vorrichtung zur automatischen Schmierung eines Kettenantriebs mit Dosierventil",
   "inventors": [
@@ -65,7 +65,7 @@ Beispielausgabe 2:
   "classification": "47c",
   "industrial_field": "Maschinenbau und Antriebstechnik"
 }}
-Beispielausgabe 3:
+Example 3:
 {{
   "title": "Verfahren zur Verbesserung der Papierbahnführung in Schnelllaufmaschinen",
   "inventors": null,

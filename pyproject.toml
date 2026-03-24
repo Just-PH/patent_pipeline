@@ -1,71 +1,78 @@
 [project]
 name = "patent-pipeline"
 version = "0.1.0"
-description = ""
+description = "Pipeline d'extraction et d'OCR pour brevets"
 authors = [
   { name = "ph delville", email = "phdelville33@gmail.com" }
 ]
 readme = "README.md"
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.10,<3.15"
 
-# ========== MAIN (runtime) ==========
-# Doit suffire pour:
-# - scripts/bench_run_ocr.py
-# - scripts/bench_run_extract.py
-# - le code src/patent_pipeline/*
+# ========== RUNTIME DEPENDENCIES (Core + OCR + LLM) ==========
+# NOTE:
+#  - torch est volontairement sorti des deps "main" pour éviter d'installer un torch CPU-only via Poetry.
+#    => torch (CUDA) est installé explicitement dans le Dockerfile.
+#  - paddlepaddle est inclus pour PaddleOCR CPU.
+#  - CRITICAL: numpy doit être <2.0 pour compatibilité avec PaddlePaddle/OpenCV
 dependencies = [
-  # --- Core
-  "pydantic (>=2.12.3,<3.0.0)",
-  "tqdm (>=4.67.1,<5.0.0)",
-  "loguru (>=0.7.3,<0.8.0)",
-
-  # --- OCR runtime
-  "pillow (>=12.0.0,<13.0.0)",
-  "pytesseract (>=0.3.13,<0.4.0)",
-  "pdf2image (>=1.17.0,<2.0.0)",
-  "pymupdf (>=1.26.6,<2.0.0)",
-  "opencv-python-headless (>=4.12.0.88,<5.0.0.0)",
-  "langdetect (>=1.0.9,<2.0.0)",
-  "python-doctr[torch] (>=1.0.0,<2.0.0)",
-  "easyocr (>=1.7.2,<2.0.0)",
-
-  # --- LLM runtime
-  "torch (>=2.9.0,<3.0.0)",
-  "transformers (>=4.57.1,<5.0.0)",
-  "accelerate (>=1.11.0,<2.0.0)",
-  "sentencepiece (>=0.2.1,<0.3.0)",
-
-  # --- Mac MLX (OK de le laisser en main si tu veux 1 seul env local)
-  "mlx-lm (>=0.28.3,<0.29.0)",
-
-  # --- Important: ton code utilise `import regex as re`
-  "regex (>=2024.0.0,<2026.0.0)",
+    "pydantic>=2.12.3,<3.0.0",
+    "tqdm>=4.67.1,<5.0.0",
+    "loguru>=0.7.3,<0.8.0",
+    "pillow>=10.2.0,<11.0.0",
+    "pytesseract>=0.3.13,<0.4.0",
+    "pdf2image>=1.17.0,<2.0.0",
+    "pymupdf>=1.19.0,<1.21.0",
+    "opencv-python-headless>=4.10.0,<5.0.0",
+    "langdetect>=1.0.9,<2.0.0",
+    "accelerate>=1.0.0,<2.0.0",
+    "sentencepiece>=0.2.1,<0.3.0",
+    "mlx-lm>=0.20.0,<0.22.0; sys_platform == 'darwin'",
+    "regex>=2024.0.0,<2026.0.0",
+    "transformers>=4.57.6,<5.0.0",
+    "paddlepaddle>=2.5.1,<3.0.0",
+    "paddleocr==2.7.0",
+    # CRITICAL: Pin numpy to 1.x for PaddlePaddle/OpenCV compatibility
+    "numpy>=1.19,<2.0",
 ]
 
 [tool.poetry]
 packages = [{ include = "patent_pipeline", from = "src" }]
 
+# ========== OPTIONAL GROUPS ==========
+
+[tool.poetry.group.bench.dependencies]
+pandas = ">=2.2.0,<3.0.0"
+
+[tool.poetry.group.doctr.dependencies]
+python-doctr = { git = "https://github.com/mindee/doctr.git", extras = ["torch"] }
+
+[tool.poetry.group.lightonocr.dependencies]
+# LightOnOCR requirements
+safetensors = "*"
+pypdfium2 = ">=4.30.0,<5.0.0"
+
+[tool.poetry.group.paddle.dependencies]
+# PaddleOCR CPU extra utils (optional)
+cython = "<3.1"
+
+[tool.poetry.group.surya.dependencies]
+surya-ocr = ">=0.4.0,<1.0.0"
+
+[tool.poetry.group.easyocr.dependencies]
+easyocr = ">=1.7.2,<2.0.0"
+
+[tool.poetry.group.torch.dependencies]
+torch = ">=2.5.0,<3.0.0"
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = ">=6.0.0"
+matplotlib = ">=3.9.0"
+seaborn = ">=0.13.0"
+streamlit = ">=1.40.0"
+streamlit-image-zoom = ">=0.0.4"
+layoutparser = ">=0.3.4"
+pyqt5 = ">=5.15.11"
+
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
+requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
-
-# ========== GROUPS ==========
-# bench = scripts de scoring/metrics (pandas)
-# dev   = notebooks / UI locale / expérimental
-[dependency-groups]
-
-bench = [
-  "pandas (>=2.3.3,<3.0.0)",
-]
-
-dev = [
-  "ipykernel (>=7.0.1,<8.0.0)",
-  "matplotlib (>=3.10.7,<4.0.0)",
-  "seaborn (>=0.13.2,<0.14.0)",
-  "pyqt5 (>=5.15.11,<6.0.0)",
-  "streamlit (>=1.51.0,<2.0.0)",
-  "streamlit-image-zoom (>=0.0.4,<0.0.5)",
-
-  # Lourd / fragile (à activer consciemment)
-  "layoutparser (>=0.3.4,<0.4.0)",
-]
