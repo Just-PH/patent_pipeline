@@ -51,6 +51,27 @@ def main():
     parser.add_argument("--model_name", type=str, default=None, help="HF model or local path")
     parser.add_argument("--llm_backend", type=str, default="auto", choices=["auto", "mlx", "pytorch"])
     parser.add_argument("--device", type=str, default=None, help="cpu/cuda/mps for pytorch backend")
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="none",
+        choices=["none", "bnb_8bit", "bnb_4bit"],
+        help="Optional model quantization for pytorch backend.",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "sdpa", "flash_attention_2"],
+        help="Attention backend for pytorch backend.",
+    )
+    parser.add_argument(
+        "--cache_implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "dynamic", "static", "offloaded", "offloaded_static"],
+        help="KV cache strategy for generate() on pytorch backend.",
+    )
     parser.add_argument("--prompt_id", type=str, default=None, help="Prompt id: v1/v2/v3")
     parser.add_argument("--prompt_template_path", type=Path, default=None, help="Path to prompt template containing {text}")
     parser.add_argument("--max_ocr_chars", type=int, default=10000)
@@ -95,6 +116,9 @@ def main():
         model_name=args.model_name,
         llm_backend=args.llm_backend,
         device=args.device,
+        quantization=args.quantization,
+        attn_implementation=args.attn_implementation,
+        cache_implementation=args.cache_implementation,
         prompt_id=args.prompt_id,
         prompt_template_path=args.prompt_template_path,
         max_ocr_chars=args.max_ocr_chars,

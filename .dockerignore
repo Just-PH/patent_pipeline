@@ -1,10 +1,13 @@
 # Data & outputs
 data/
 output/
+output_vm/
 models/
 compare_benchmark/
 *.jsonl
 *.csv
+*.tar
+*.tar.gz
 
 # Caches
 __pycache__/
@@ -12,6 +15,8 @@ __pycache__/
 .hf_cache/
 .cache/
 .env
+.venv/
+venv/
 
 # VCS
 .git/

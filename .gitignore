@@ -34,6 +34,8 @@ datasets/
 data/ocr_text/
 output
 *.txt
+!requirements.slm-mistral31.txt
+!requirements.slm-mistral31-vllm.txt
 *.out
 *.tar
 *.gz

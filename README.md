@@ -160,6 +160,106 @@ bash scripts/run_azure.sh
 
 ---
 
+## 🐳 Docker Image: SLM Mistral 3.1 24B
+
+The repo now includes three dedicated images for the text-only SLM path:
+
+```bash
+bash scripts/build_docker_slm_mistral31.sh
+bash scripts/build_docker_slm_mistral31_static.sh
+bash scripts/build_docker_slm_mistral31_vllm.sh
+```
+
+Runtime image defaults:
+- image tag: `patent-pipeline:slm-mistral31`
+- platform: `linux/amd64`
+- legacy alias: `patent-pipeline:slm-ministral3`
+
+Runtime image (`patent-pipeline:slm-mistral31`) is intentionally slim:
+- no OCR stack
+- pinned CUDA Torch + Transformers runtime
+- Hugging Face and Torch caches under `/data/cache`
+- `bitsandbytes` included for optional `--quantization bnb_8bit|bnb_4bit`
+
+Static image (`patent-pipeline:slm-mistral31-static`) adds the compiler toolchain
+required for `cache_implementation=static`:
+- `build-essential`
+- `python3-dev`
+- `CC=/usr/bin/gcc`
+- `CXX=/usr/bin/g++`
+
+vLLM image defaults:
+- image tag: `patent-pipeline:slm-mistral31-vllm`
+- platform: `linux/amd64`
+- based on the official `vllm/vllm-openai` image
+- intended for `--backend vllm` benchmarks and smoke tests
+- runs with `--ipc=host` on the VM to match vLLM Docker guidance
+
+The VM extraction wrappers now default to an A100-friendly setup:
+- `--torch-dtype bf16`
+- `--attn-implementation sdpa`
+- `--cache-implementation dynamic`
+
+Example benchmark run inside the container:
+
+```bash
+docker run --rm --gpus all \
+  -v "$PWD:/work" \
+  -v hf_cache:/data/cache/huggingface \
+  -v torch_cache:/data/cache/torch \
+  patent-pipeline:slm-mistral31 \
+  python /app/scripts/bench_run_extract.py \
+    --texts-dir /work/data/ocr_text \
+    --out-root /work/output/slm \
+    --run-name mistral31_smoke \
+    --model-name mistralai/Mistral-Small-3.1-24B-Instruct-2503 \
+    --backend pytorch \
+    --device cuda \
+    --torch-dtype bf16 \
+    --attn-implementation sdpa \
+    --cache-implementation dynamic \
+    --force
+```
+
+`flash_attention_2` is not installed by default in this image. The image is runtime-only and does not ship a C compiler, so prefer `cache_implementation=dynamic` or `auto` unless you build a compiler-enabled variant.
+
+Example vLLM smoke inside the dedicated image:
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v "$PWD:/work" \
+  -v hf_cache:/data/cache/huggingface \
+  -v torch_cache:/data/cache/torch \
+  patent-pipeline:slm-mistral31-vllm \
+  python /app/scripts/bench_run_extract.py \
+    --texts-dir /work/data/ocr_text \
+    --out-root /work/output/slm \
+    --run-name mistral31_vllm_smoke \
+    --model-name mistralai/Mistral-Small-3.1-24B-Instruct-2503 \
+    --backend vllm \
+    --torch-dtype bf16 \
+    --vllm-enable-prefix-caching \
+    --vllm-tensor-parallel-size 1 \
+    --vllm-gpu-memory-utilization 0.9 \
+    --strategy baseline \
+    --force
+```
+
+Static smoke on the VM:
+
+```bash
+bash scripts/vm_smoke_mistral31.sh
+bash scripts/vm_smoke_mistral31_static.sh
+bash scripts/vm_smoke_mistral31_vllm.sh
+```
+
+Recommended split:
+- `patent-pipeline:slm-mistral31`: production default for `dynamic|auto`
+- `patent-pipeline:slm-mistral31-static`: compiler-enabled variant for `static`
+- `patent-pipeline:slm-mistral31-vllm`: dedicated image for `backend=vllm` throughput and prefix-caching tests
+
+---
+
 ## 📊 OCR Benchmark Example
 
 | Engine            | Language mix | Accuracy (avg.) | Speed (pages/s) |

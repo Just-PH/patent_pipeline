@@ -11,13 +11,17 @@ cd "$ROOT_DIR"
 VM_HOST="${VM_HOST:-vm-ab02.francecentral.cloudapp.azure.com}"
 VM_USER="${VM_USER:-user-vm-ab02}"
 VM_WORK="${VM_WORK:-/data/work}"
-IMAGE="${IMAGE:-patent-pipeline:slm-ministral3}"
+IMAGE="${IMAGE:-patent-pipeline:slm-mistral31}"
 
 OCR_RUN_DIR="${OCR_RUN_DIR:-output/ch_ocr/tesserocr_ch500_backend_workers6}"
 PROMPT_TEMPLATE_PATH="${PROMPT_TEMPLATE_PATH:-$ROOT_DIR/data/prompts/swiss_patent_biblio_multilingual_v1.txt}"
 LOCAL_OUT_ROOT="${LOCAL_OUT_ROOT:-$ROOT_DIR/output/vm_extract}"
 RUN_NAME="${RUN_NAME:-mistral31_24b_ch_prenotation}"
 MODEL_NAME="${MODEL_NAME:-mistralai/Mistral-Small-3.1-24B-Instruct-2503}"
+TORCH_DTYPE="${TORCH_DTYPE:-bf16}"
+QUANTIZATION="${QUANTIZATION:-none}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+CACHE_IMPLEMENTATION="${CACHE_IMPLEMENTATION:-dynamic}"
 MAX_OCR_CHARS="${MAX_OCR_CHARS:-12000}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1200}"
 STRATEGY="${STRATEGY:-baseline}"
@@ -86,6 +90,10 @@ bash "$VM_PYTHON_SH" --image "$IMAGE" \
   --model-name "$MODEL_NAME" \
   --backend pytorch \
   --device cuda \
+  --torch-dtype "$TORCH_DTYPE" \
+  --quantization "$QUANTIZATION" \
+  --attn-implementation "$ATTN_IMPLEMENTATION" \
+  --cache-implementation "$CACHE_IMPLEMENTATION" \
   --prompt-template-path "$PROMPT_TEMPLATE_PATH" \
   --strategy "$STRATEGY" \
   --max-ocr-chars "$MAX_OCR_CHARS" \

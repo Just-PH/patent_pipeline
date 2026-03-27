@@ -1,0 +1,50 @@
+FROM vllm/vllm-openai:v0.11.0
+
+ARG HF_MODEL=mistralai/Mistral-Small-3.1-24B-Instruct-2503
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    HF_HOME=/data/cache/huggingface \
+    HF_HUB_CACHE=/data/cache/huggingface \
+    TORCH_HOME=/data/cache/torch \
+    HF_MODEL=${HF_MODEL} \
+    TOKENIZERS_PARALLELISM=false
+
+USER root
+WORKDIR /app
+
+RUN mkdir -p /data/cache/huggingface /data/cache/torch
+
+RUN if ! command -v python >/dev/null 2>&1; then \
+      ln -sf "$(command -v python3)" /usr/local/bin/python; \
+    fi
+
+COPY requirements.slm-mistral31-vllm.txt /tmp/requirements.slm-mistral31-vllm.txt
+RUN python3 -m pip install --no-cache-dir -U pip setuptools wheel && \
+    python3 -m pip install --no-cache-dir -r /tmp/requirements.slm-mistral31-vllm.txt && \
+    rm -f /tmp/requirements.slm-mistral31-vllm.txt
+
+COPY src /app/src
+COPY scripts /app/scripts
+
+RUN python3 - <<'PY'
+import importlib.util
+import torch
+import transformers
+import vllm
+from patent_pipeline.pydantic_extraction.patent_extractor import PatentExtractor
+
+print("torch:", torch.__version__)
+print("transformers:", transformers.__version__)
+print("vllm:", vllm.__version__)
+print("bitsandbytes_installed:", importlib.util.find_spec("bitsandbytes") is not None)
+print("extractor_import_ok:", PatentExtractor.__name__)
+PY
+
+# vLLM base image ships an API-server entrypoint; clear it so the container behaves
+# like the other repo images and can run bench scripts directly.
+ENTRYPOINT []
+CMD ["bash"]

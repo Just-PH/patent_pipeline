@@ -16,6 +16,7 @@ def _load_module_with_fake_transformers():
     fake.AutoConfig = object
     fake.AutoModelForCausalLM = object
     fake.AutoTokenizer = object
+    fake.BitsAndBytesConfig = object
 
     def _fake_pipeline(*args, **kwargs):
         return None
@@ -25,6 +26,8 @@ def _load_module_with_fake_transformers():
     fake.Mistral3ForConditionalGeneration = object
 
     sys.modules["transformers"] = fake
+    if "patent_pipeline.pydantic_extraction.runtime" in sys.modules:
+        del sys.modules["patent_pipeline.pydantic_extraction.runtime"]
     if "patent_pipeline.pydantic_extraction.patent_extractor" in sys.modules:
         del sys.modules["patent_pipeline.pydantic_extraction.patent_extractor"]
     return importlib.import_module("patent_pipeline.pydantic_extraction.patent_extractor")

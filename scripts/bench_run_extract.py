@@ -90,7 +90,7 @@ def main() -> None:
     # Model / backend
     # ----------------------------
     ap.add_argument("--model-name", type=str, default=None, help="HF repo id or local path; defaults to env HF_MODEL.")
-    ap.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "pytorch"])
+    ap.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "pytorch", "vllm"])
     ap.add_argument("--device", type=str, default=None, help="cpu/cuda/mps (only relevant for pytorch)")
     ap.add_argument(
         "--device-map",
@@ -104,6 +104,87 @@ def main() -> None:
         default="auto",
         choices=["auto", "bf16", "fp16", "fp32"],
         help="PyTorch model dtype policy. auto keeps backend defaults; others force dtype.",
+    )
+    ap.add_argument(
+        "--quantization",
+        type=str,
+        default="none",
+        choices=["none", "bnb_8bit", "bnb_4bit"],
+        help="Optional model quantization for pytorch backend.",
+    )
+    ap.add_argument(
+        "--attn-implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "sdpa", "flash_attention_2"],
+        help="Attention backend for pytorch backend.",
+    )
+    ap.add_argument(
+        "--cache-implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "dynamic", "static", "offloaded", "offloaded_static"],
+        help="KV cache strategy for generate() on pytorch backend.",
+    )
+    ap.add_argument(
+        "--vllm-enable-prefix-caching",
+        action="store_true",
+        help="Enable vLLM automatic prefix caching.",
+    )
+    ap.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for vLLM backend.",
+    )
+    ap.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory utilization target for vLLM backend.",
+    )
+    ap.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=None,
+        help="Optional max_model_len override for vLLM backend.",
+    )
+    ap.add_argument(
+        "--vllm-swap-space",
+        type=float,
+        default=4.0,
+        help="Swap space in GiB for vLLM backend.",
+    )
+    ap.add_argument(
+        "--vllm-enforce-eager",
+        action="store_true",
+        help="Force eager execution in vLLM.",
+    )
+    ap.add_argument(
+        "--vllm-doc-batch-size",
+        type=int,
+        default=32,
+        help="Application-level micro-batch size (number of documents) for vLLM baseline batching.",
+    )
+    ap.set_defaults(vllm_sort_by_prompt_length=True)
+    ap.add_argument(
+        "--vllm-sort-by-prompt-length",
+        dest="vllm_sort_by_prompt_length",
+        action="store_true",
+        help="Sort prompts by length before vLLM micro-batching.",
+    )
+    ap.add_argument(
+        "--no-vllm-sort-by-prompt-length",
+        dest="vllm_sort_by_prompt_length",
+        action="store_false",
+        help="Keep original document order when forming vLLM micro-batches.",
+    )
+    ap.add_argument(
+        "--vllm-tokenizer-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "mistral"],
+        help="Tokenizer mode for vLLM backend.",
     )
 
     # ----------------------------
@@ -223,6 +304,18 @@ def main() -> None:
         device=args.device,
         device_map=args.device_map,
         torch_dtype=args.torch_dtype,
+        quantization=args.quantization,
+        attn_implementation=args.attn_implementation,
+        cache_implementation=args.cache_implementation,
+        vllm_enable_prefix_caching=bool(args.vllm_enable_prefix_caching),
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_model_len=args.vllm_max_model_len,
+        vllm_swap_space=args.vllm_swap_space,
+        vllm_enforce_eager=bool(args.vllm_enforce_eager),
+        vllm_doc_batch_size=args.vllm_doc_batch_size,
+        vllm_sort_by_prompt_length=bool(args.vllm_sort_by_prompt_length),
+        vllm_tokenizer_mode=args.vllm_tokenizer_mode,
         # prompt selection
         prompt_id=args.prompt_id,
         prompt_template=prompt_template,
@@ -264,6 +357,18 @@ def main() -> None:
             "device": extractor.device,
             "device_map": args.device_map,
             "torch_dtype": args.torch_dtype,
+            "quantization": args.quantization,
+            "attn_implementation": args.attn_implementation,
+            "cache_implementation": args.cache_implementation,
+            "vllm_enable_prefix_caching": bool(args.vllm_enable_prefix_caching),
+            "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+            "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+            "vllm_max_model_len": args.vllm_max_model_len,
+            "vllm_swap_space": args.vllm_swap_space,
+            "vllm_enforce_eager": bool(args.vllm_enforce_eager),
+            "vllm_doc_batch_size": args.vllm_doc_batch_size,
+            "vllm_sort_by_prompt_length": bool(args.vllm_sort_by_prompt_length),
+            "vllm_tokenizer_mode": args.vllm_tokenizer_mode,
             # Prompt identity (run-stable)
             "prompt_id": extractor.prompt_id,
             "prompt_template_path": args.prompt_template_path,
