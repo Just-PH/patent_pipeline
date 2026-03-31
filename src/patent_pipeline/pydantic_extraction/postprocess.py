@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections import Counter
 from datetime import date
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import regex as re
@@ -57,11 +59,37 @@ def normalize_entity_list(value: Any) -> Optional[List[Dict[str, Optional[str]]]
     if value is None:
         return None
 
+    def _norm_entity(name: Any, address: Any) -> Optional[Dict[str, Optional[str]]]:
+        name = str(name or "").strip()
+        if not name:
+            return None
+        address = str(address).strip() if address is not None else None
+        if not address:
+            address = None
+        return {"name": name, "address": address}
+
+    def _dedupe_entities(items: List[Dict[str, Optional[str]]]) -> Optional[List[Dict[str, Optional[str]]]]:
+        seen = set()
+        out: List[Dict[str, Optional[str]]] = []
+        for item in items:
+            normalized = _norm_entity(item.get("name"), item.get("address"))
+            if normalized is None:
+                continue
+            key = (
+                re.sub(r"\s+", " ", normalized["name"].lower()),
+                re.sub(r"\s+", " ", (normalized["address"] or "").lower()),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(normalized)
+        return out or None
+
     if isinstance(value, list) and all(isinstance(item, dict) for item in value):
-        return value
+        return _dedupe_entities(value)
 
     if isinstance(value, str):
-        entities = []
+        entities: List[Dict[str, Optional[str]]] = []
         for chunk in value.split(";"):
             chunk = chunk.strip()
             if not chunk:
@@ -71,9 +99,27 @@ def normalize_entity_list(value: Any) -> Optional[List[Dict[str, Optional[str]]]
                 entities.append({"name": match.group(1).strip(), "address": match.group(2).strip()})
             else:
                 entities.append({"name": chunk, "address": None})
-        return entities if entities else None
+        return _dedupe_entities(entities)
 
     return None
+
+
+def normalize_identity_name(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def same_person_identity(left: Any, right: Any, *, threshold: float = 0.92) -> bool:
+    left_norm = normalize_identity_name(left)
+    right_norm = normalize_identity_name(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    return SequenceMatcher(None, left_norm, right_norm).ratio() >= threshold
 
 
 def merge_entity_lists(values: List[Any]) -> Optional[List[Dict[str, Optional[str]]]]:

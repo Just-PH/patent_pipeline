@@ -8,7 +8,7 @@ But:
 - Écrire un JSONL (preds.jsonl) + un run.json
 
 Support matrice 3D:
-- OCR × SLM × PROMPT via --prompt-id (v1/v2/v3)
+- OCR × SLM × PROMPT via --prompt-id (v1/v2/v3/v4)
 - Compatibilité: --prompt-template-path (mutuellement exclusif avec --prompt-id)
 
 Note benchmark/repro:
@@ -194,13 +194,20 @@ def main() -> None:
         "--prompt-id",
         type=str,
         default=None,
-        help="Prompt ID (e.g. v1, v2, v3) resolved via prompt_templates.py",
+        help="Prompt ID (e.g. v1, v2, v3, v4) resolved via prompt_templates.py",
     )
     ap.add_argument(
         "--prompt-template-path",
         type=str,
         default=None,
         help="Path to a prompt template file containing {text} (mutually exclusive with --prompt-id)",
+    )
+    ap.add_argument(
+        "--guardrail-profile",
+        type=str,
+        default="auto",
+        choices=["auto", "off", "de_legacy_self_applicant"],
+        help="Optional post-generation guardrail profile. auto keeps current prompt-driven defaults.",
     )
 
     # ----------------------------
@@ -319,6 +326,7 @@ def main() -> None:
         # prompt selection
         prompt_id=args.prompt_id,
         prompt_template=prompt_template,
+        guardrail_profile=args.guardrail_profile,
         # gen params
         max_ocr_chars=args.max_ocr_chars,
         max_new_tokens=args.max_new_tokens,
@@ -371,6 +379,7 @@ def main() -> None:
             "vllm_tokenizer_mode": args.vllm_tokenizer_mode,
             # Prompt identity (run-stable)
             "prompt_id": extractor.prompt_id,
+            "guardrail_profile": extractor.guardrail_profile,
             "prompt_template_path": args.prompt_template_path,
             "prompt_template_source": getattr(extractor, "prompt_template_source", None),
             "prompt_hash": getattr(extractor, "prompt_hash", None),

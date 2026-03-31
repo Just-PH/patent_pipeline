@@ -99,6 +99,12 @@ def main() -> None:
     ap.add_argument("--model-name", type=str, default=None)
     ap.add_argument("--prompt-id", type=str, default=None)
     ap.add_argument("--prompt-template-path", type=str, default=None)
+    ap.add_argument(
+        "--guardrail-profile",
+        type=str,
+        default="auto",
+        choices=["auto", "off", "de_legacy_self_applicant"],
+    )
     ap.add_argument("--max-ocr-chars", type=int, default=10000)
     ap.add_argument("--max-new-tokens", type=int, default=1024)
     ap.add_argument("--temperature", type=float, default=0.0)
@@ -215,6 +221,8 @@ def main() -> None:
         common_argv.extend(["--prompt-id", args.prompt_id])
     if args.prompt_template_path:
         common_argv.extend(["--prompt-template-path", args.prompt_template_path])
+    if args.guardrail_profile:
+        common_argv.extend(["--guardrail-profile", args.guardrail_profile])
     if args.do_sample:
         common_argv.append("--do-sample")
     if args.save_strategy_meta:

@@ -6,6 +6,9 @@ TEXTS_DIR="${TEXTS_DIR:-/data/work/patent_pipeline/output/ch_ocr/tesserocr_ch500
 OUT_ROOT="${OUT_ROOT:-/data/work/patent_pipeline/output_vm/slm_smoke}"
 RUN_NAME="${RUN_NAME:-smoke_mistral31_vllm_prefix_3docs}"
 MODEL_NAME="${MODEL_NAME:-mistralai/Mistral-Small-3.1-24B-Instruct-2503}"
+PROMPT_ID="${PROMPT_ID:-}"
+PROMPT_TEMPLATE="${PROMPT_TEMPLATE:-}"
+GUARDRAIL_PROFILE="${GUARDRAIL_PROFILE:-auto}"
 
 TORCH_DTYPE="${TORCH_DTYPE:-bf16}"
 STRATEGY="${STRATEGY:-baseline}"
@@ -43,6 +46,11 @@ fi
 if [[ "$VLLM_SORT_BY_PROMPT_LENGTH" != "1" ]]; then
   EXTRA_ARGS+=(--no-vllm-sort-by-prompt-length)
 fi
+if [[ -n "$PROMPT_ID" ]]; then
+  EXTRA_ARGS+=(--prompt-id "${PROMPT_ID}")
+elif [[ -n "$PROMPT_TEMPLATE" ]]; then
+  EXTRA_ARGS+=(--prompt-template-path "/work${PROMPT_TEMPLATE#${WORK_ROOT}}")
+fi
 
 docker run --rm --gpus all --ipc=host -v "${WORK_ROOT}:/work" "$IMAGE" bash -lc "
   export HF_HOME=/work/.cache/huggingface \
@@ -62,6 +70,7 @@ docker run --rm --gpus all --ipc=host -v "${WORK_ROOT}:/work" "$IMAGE" bash -lc 
     --vllm-swap-space ${VLLM_SWAP_SPACE} \
     --vllm-doc-batch-size ${VLLM_DOC_BATCH_SIZE} \
     --vllm-tokenizer-mode ${VLLM_TOKENIZER_MODE} \
+    --guardrail-profile ${GUARDRAIL_PROFILE} \
     --strategy ${STRATEGY} \
     --timings ${TIMINGS} \
     --save-raw-output \

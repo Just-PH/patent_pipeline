@@ -11,10 +11,13 @@ IMAGE="${IMAGE:-patent-pipeline:slm-mistral31-vllm}"
 MODEL_NAME="${MODEL_NAME:-mistralai/Mistral-Small-3.1-24B-Instruct-2503}"
 TEXTS_DIR="${TEXTS_DIR:-$BENCH_ROOT/data/real/real500_tesserocr_texts}"
 OUT_ROOT="${OUT_ROOT:-$BENCH_ROOT/output_vm/slm_500_real}"
+PROMPT_ID="${PROMPT_ID:-}"
 PROMPT_TEMPLATE="${PROMPT_TEMPLATE:-$BENCH_ROOT/prompts/extraction/exchaustive_prompt_V2-fixing-inventors-recalls.txt}"
+GUARDRAIL_PROFILE="${GUARDRAIL_PROFILE:-auto}"
 RUN_NAME="${RUN_NAME:-real500_mistral31_24b__baseline__v2inv_vllm}"
 
 TORCH_DTYPE="${TORCH_DTYPE:-bf16}"
+STRATEGY="${STRATEGY:-baseline}"
 TIMINGS="${TIMINGS:-detailed}"
 LIMIT="${LIMIT:-}"
 SAVE_RAW_OUTPUT="${SAVE_RAW_OUTPUT:-1}"
@@ -40,7 +43,7 @@ if [[ "$TEXTS_DIR" != /data/work/* && ! -d "$TEXTS_DIR" ]]; then
   exit 1
 fi
 
-if [[ "$PROMPT_TEMPLATE" != /data/work/* && ! -f "$PROMPT_TEMPLATE" ]]; then
+if [[ -z "$PROMPT_ID" && "$PROMPT_TEMPLATE" != /data/work/* && ! -f "$PROMPT_TEMPLATE" ]]; then
   echo "Missing prompt template: $PROMPT_TEMPLATE" >&2
   exit 1
 fi
@@ -53,8 +56,7 @@ ARGS=(
   --model-name "$MODEL_NAME"
   --backend vllm
   --torch-dtype "$TORCH_DTYPE"
-  --prompt-template-path "$PROMPT_TEMPLATE"
-  --strategy baseline
+  --strategy "$STRATEGY"
   --merge-policy prefer_non_null
   --header-lines 30
   --targeted-rerun-threshold 0.6
@@ -66,8 +68,15 @@ ARGS=(
   --vllm-swap-space "$VLLM_SWAP_SPACE"
   --vllm-doc-batch-size "$VLLM_DOC_BATCH_SIZE"
   --vllm-tokenizer-mode "$VLLM_TOKENIZER_MODE"
+  --guardrail-profile "$GUARDRAIL_PROFILE"
   --force
 )
+
+if [[ -n "$PROMPT_ID" ]]; then
+  ARGS+=(--prompt-id "$PROMPT_ID")
+else
+  ARGS+=(--prompt-template-path "$PROMPT_TEMPLATE")
+fi
 
 if [[ "$VLLM_ENABLE_PREFIX_CACHING" == "1" ]]; then
   ARGS+=(--vllm-enable-prefix-caching)

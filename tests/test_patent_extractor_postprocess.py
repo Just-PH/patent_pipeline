@@ -12,6 +12,26 @@ from patent_pipeline.pydantic_extraction import postprocess
 
 
 class TestPatentExtractorPostprocess(unittest.TestCase):
+    def test_parse_and_validate_dedupes_duplicate_assignees(self):
+        raw = """
+        {
+          "title": "Beispiel",
+          "inventors": [{"name": "Alice Example", "address": "Paris"}],
+          "assignees": [
+            {"name": "Müller & Mann", "address": "Berlin"},
+            {"name": "Müller & Mann", "address": "Berlin"}
+          ],
+          "pub_date_application": "1920-01-01",
+          "pub_date_publication": "1920-02-01",
+          "pub_date_foreign": null,
+          "classification": "G01",
+          "industrial_field": null
+        }
+        """
+        meta = postprocess.parse_and_validate(raw)
+        self.assertEqual(len(meta.assignees or []), 1)
+        self.assertEqual(meta.assignees[0].name, "Müller & Mann")
+
     def test_parse_and_validate_normalizes_legacy_fields_and_moves_companies(self):
         raw = """
         {

@@ -72,8 +72,15 @@ def main():
         choices=["auto", "dynamic", "static", "offloaded", "offloaded_static"],
         help="KV cache strategy for generate() on pytorch backend.",
     )
-    parser.add_argument("--prompt_id", type=str, default=None, help="Prompt id: v1/v2/v3")
+    parser.add_argument("--prompt_id", type=str, default=None, help="Prompt id: v1/v2/v3/v4")
     parser.add_argument("--prompt_template_path", type=Path, default=None, help="Path to prompt template containing {text}")
+    parser.add_argument(
+        "--guardrail_profile",
+        type=str,
+        default="auto",
+        choices=["auto", "off", "de_legacy_self_applicant"],
+        help="Optional post-generation guardrail profile.",
+    )
     parser.add_argument("--max_ocr_chars", type=int, default=10000)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -121,6 +128,7 @@ def main():
         cache_implementation=args.cache_implementation,
         prompt_id=args.prompt_id,
         prompt_template_path=args.prompt_template_path,
+        guardrail_profile=args.guardrail_profile,
         max_ocr_chars=args.max_ocr_chars,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,

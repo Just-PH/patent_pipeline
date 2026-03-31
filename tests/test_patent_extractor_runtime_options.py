@@ -47,6 +47,11 @@ class TestPatentExtractorRuntimeOptions(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pe.PatentExtractor(backend="vllm", cache_implementation="dynamic")
 
+    def test_invalid_guardrail_profile_is_rejected(self):
+        with patch.object(pe.PatentExtractor, "_load_model", lambda self: None):
+            with self.assertRaises(ValueError):
+                pe.PatentExtractor(guardrail_profile="weird")
+
     def test_build_quantization_config_for_bnb_8bit(self):
         ex = pe.PatentExtractor.__new__(pe.PatentExtractor)
         ex.quantization = "bnb_8bit"
