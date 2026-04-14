@@ -184,6 +184,17 @@ class DocumentReport:
     t_total_s: float = 0.0
 
 
+@dataclass
+class _PreparedBackendDoc:
+    doc_path: Path
+    out_txt_path: Path
+    page_img: Any
+    deskew_angle: float
+    t_load_s: float = 0.0
+    t_deskew_s: float = 0.0
+    t_segment_s: float = 0.0
+
+
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".pdf"}
 
 
@@ -319,6 +330,221 @@ class Pipeline_OCR:
         self.segmenter = segmenter
         self.deskewer = deskewer
         self.ocr_backend = ocr_backend
+
+    def _backend_doc_batch_size(self, cfg: PipelineOCRConfig) -> int:
+        if cfg.segmentation_mode != "backend":
+            return 1
+        if not self.ocr_backend.is_gpu:
+            return 1
+        try:
+            batch_size = int((cfg.ocr_config or {}).get("batch_size", 1))
+        except (TypeError, ValueError):
+            return 1
+        return max(1, batch_size)
+
+    def _prepare_backend_doc(
+        self,
+        doc_path: Path,
+        cfg: PipelineOCRConfig,
+    ) -> tuple[Optional[_PreparedBackendDoc], Optional[DocumentReport]]:
+        out_txt_path = cfg.out_dir / f"{doc_path.stem}.txt"
+
+        timings_mode: TimingsMode = getattr(cfg, "timings", "off")
+        want_basic = timings_mode in ("basic", "detailed")
+        want_detailed = timings_mode == "detailed"
+        t_load_s = t_deskew_s = t_segment_s = t_total_s = 0.0
+        t0_total = time.perf_counter() if want_basic else 0.0
+
+        if out_txt_path.exists() and not cfg.force:
+            return None, DocumentReport(
+                file_name=str(doc_path),
+                status="skipped",
+                n_blocks=0,
+                n_blocks_kept=0,
+                deskew_angle=0.0,
+                out_txt=str(out_txt_path),
+                t_total_s=t_total_s,
+            )
+
+        try:
+            if want_detailed:
+                t0 = time.perf_counter()
+                page_img = load_page_as_pil(doc_path)
+                t_load_s = time.perf_counter() - t0
+            else:
+                page_img = load_page_as_pil(doc_path)
+
+            if want_detailed:
+                t0 = time.perf_counter()
+                page_img, deskew_angle = deskew_page_if_needed(
+                    page_img,
+                    deskewer=self.deskewer,
+                    max_angle=cfg.deskew_max_angle,
+                    enabled=cfg.deskew,
+                )
+                t_deskew_s = time.perf_counter() - t0
+            else:
+                page_img, deskew_angle = deskew_page_if_needed(
+                    page_img,
+                    deskewer=self.deskewer,
+                    max_angle=cfg.deskew_max_angle,
+                    enabled=cfg.deskew,
+                )
+
+            if want_basic:
+                t_total_s = time.perf_counter() - t0_total
+
+            return _PreparedBackendDoc(
+                doc_path=doc_path,
+                out_txt_path=out_txt_path,
+                page_img=page_img,
+                deskew_angle=deskew_angle,
+                t_load_s=t_load_s,
+                t_deskew_s=t_deskew_s,
+                t_segment_s=t_segment_s,
+            ), None
+        except Exception as e:
+            cfg.out_dir.mkdir(parents=True, exist_ok=True)
+            if cfg.keep_empty_docs:
+                out_txt_path.write_text("", encoding="utf-8")
+
+            if want_basic:
+                t_total_s = time.perf_counter() - t0_total
+
+            return None, DocumentReport(
+                file_name=str(doc_path),
+                status="error",
+                n_blocks=0,
+                n_blocks_kept=0,
+                deskew_angle=0.0,
+                out_txt=str(out_txt_path),
+                error="".join(traceback.format_exception_only(type(e), e)).strip(),
+                t_load_s=t_load_s,
+                t_deskew_s=t_deskew_s,
+                t_segment_s=t_segment_s,
+                t_total_s=t_total_s,
+            )
+
+    def _finalize_backend_doc(
+        self,
+        prepared: _PreparedBackendDoc,
+        text: str,
+        cfg: PipelineOCRConfig,
+        *,
+        t_ocr_s: float,
+    ) -> DocumentReport:
+        timings_mode: TimingsMode = getattr(cfg, "timings", "off")
+        want_basic = timings_mode in ("basic", "detailed")
+        want_detailed = timings_mode == "detailed"
+
+        kept = 0
+        full_text = (text or "").strip()
+        if full_text:
+            kept = 1
+
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        t_write_s = 0.0
+        if want_detailed:
+            t0 = time.perf_counter()
+            if full_text or cfg.keep_empty_docs:
+                prepared.out_txt_path.write_text(full_text, encoding="utf-8")
+            t_write_s = time.perf_counter() - t0
+        else:
+            if full_text or cfg.keep_empty_docs:
+                prepared.out_txt_path.write_text(full_text, encoding="utf-8")
+
+        t_total_s = 0.0
+        if want_basic:
+            t_total_s = prepared.t_load_s + prepared.t_deskew_s + prepared.t_segment_s + t_ocr_s + t_write_s
+
+        return DocumentReport(
+            file_name=str(prepared.doc_path),
+            status="ok" if full_text else "empty",
+            n_blocks=1,
+            n_blocks_kept=kept,
+            deskew_angle=prepared.deskew_angle,
+            out_txt=str(prepared.out_txt_path),
+            t_load_s=prepared.t_load_s,
+            t_deskew_s=prepared.t_deskew_s,
+            t_segment_s=prepared.t_segment_s,
+            t_ocr_s=t_ocr_s,
+            t_write_s=t_write_s,
+            t_total_s=t_total_s,
+        )
+
+    def _process_backend_doc_batch(
+        self,
+        prepared_docs: List[_PreparedBackendDoc],
+        cfg: PipelineOCRConfig,
+    ) -> List[DocumentReport]:
+        if not prepared_docs:
+            return []
+
+        timings_mode: TimingsMode = getattr(cfg, "timings", "off")
+        want_basic = timings_mode in ("basic", "detailed")
+
+        imgs = [doc.page_img for doc in prepared_docs]
+        batch_ocr_s = 0.0
+
+        try:
+            if want_basic:
+                t0 = time.perf_counter()
+                texts = self.ocr_backend.run_blocks_ocr(imgs, cfg.ocr_config)
+                batch_ocr_s = time.perf_counter() - t0
+            else:
+                texts = self.ocr_backend.run_blocks_ocr(imgs, cfg.ocr_config)
+
+            if len(texts) != len(prepared_docs):
+                raise ValueError(
+                    f"OCR backend returned {len(texts)} results for {len(prepared_docs)} backend docs "
+                    f"(backend={self.ocr_backend.name})"
+                )
+
+            per_doc_ocr_s = (batch_ocr_s / len(prepared_docs)) if want_basic else 0.0
+            return [
+                self._finalize_backend_doc(prepared, txt, cfg, t_ocr_s=per_doc_ocr_s)
+                for prepared, txt in zip(prepared_docs, texts)
+            ]
+        except Exception:
+            rows: List[DocumentReport] = []
+            for prepared in prepared_docs:
+                item_ocr_s = 0.0
+                try:
+                    if want_basic:
+                        t0 = time.perf_counter()
+                        texts = self.ocr_backend.run_blocks_ocr([prepared.page_img], cfg.ocr_config)
+                        item_ocr_s = time.perf_counter() - t0
+                    else:
+                        texts = self.ocr_backend.run_blocks_ocr([prepared.page_img], cfg.ocr_config)
+
+                    if len(texts) != 1:
+                        raise ValueError(
+                            f"OCR backend returned {len(texts)} results for 1 backend doc "
+                            f"(backend={self.ocr_backend.name})"
+                        )
+                    rows.append(self._finalize_backend_doc(prepared, texts[0], cfg, t_ocr_s=item_ocr_s))
+                except Exception as e:
+                    if cfg.keep_empty_docs:
+                        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+                        prepared.out_txt_path.write_text("", encoding="utf-8")
+                    total_s = prepared.t_load_s + prepared.t_deskew_s + prepared.t_segment_s + item_ocr_s
+                    rows.append(
+                        DocumentReport(
+                            file_name=str(prepared.doc_path),
+                            status="error",
+                            n_blocks=1,
+                            n_blocks_kept=0,
+                            deskew_angle=prepared.deskew_angle,
+                            out_txt=str(prepared.out_txt_path),
+                            error="".join(traceback.format_exception_only(type(e), e)).strip(),
+                            t_load_s=prepared.t_load_s,
+                            t_deskew_s=prepared.t_deskew_s,
+                            t_segment_s=prepared.t_segment_s,
+                            t_ocr_s=item_ocr_s,
+                            t_total_s=total_s if want_basic else 0.0,
+                        )
+                    )
+            return rows
 
     def _process_one(self, doc_path: Path, cfg: PipelineOCRConfig) -> DocumentReport:
         out_txt_path = cfg.out_dir / f"{doc_path.stem}.txt"
@@ -539,6 +765,40 @@ class Pipeline_OCR:
             parallel_eff = "none"
 
         rows: List[DocumentReport] = []
+
+        backend_doc_batch_size = self._backend_doc_batch_size(cfg)
+        if parallel_eff == "none" and workers_eff <= 1 and backend_doc_batch_size > 1:
+            prepared_batch: List[_PreparedBackendDoc] = []
+            for p in docs:
+                prepared, direct_row = self._prepare_backend_doc(p, cfg)
+                if direct_row is not None:
+                    rows.append(direct_row)
+                    print(f" - {p.name}: {direct_row.status} ({direct_row.n_blocks_kept}/{direct_row.n_blocks})")
+                    if progress_callback:
+                        progress_callback(direct_row, len(rows), total_docs)
+                    continue
+
+                if prepared is None:
+                    continue
+
+                prepared_batch.append(prepared)
+                if len(prepared_batch) < backend_doc_batch_size:
+                    continue
+
+                for row in self._process_backend_doc_batch(prepared_batch, cfg):
+                    rows.append(row)
+                    print(f" - {Path(row.file_name).name}: {row.status} ({row.n_blocks_kept}/{row.n_blocks})")
+                    if progress_callback:
+                        progress_callback(row, len(rows), total_docs)
+                prepared_batch = []
+
+            if prepared_batch:
+                for row in self._process_backend_doc_batch(prepared_batch, cfg):
+                    rows.append(row)
+                    print(f" - {Path(row.file_name).name}: {row.status} ({row.n_blocks_kept}/{row.n_blocks})")
+                    if progress_callback:
+                        progress_callback(row, len(rows), total_docs)
+            return rows
 
         if parallel_eff == "none" or workers_eff <= 1:
             for p in docs:

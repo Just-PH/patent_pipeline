@@ -1,63 +1,42 @@
-# 📄 src/patent_pipeline/pydantic_extraction/patent_extractor.py
-"""
-PatentExtractor
-
-Façade publique pour l'extraction SLM.
-
-Les responsabilités internes sont maintenant réparties par domaine:
-- runtime.py      : chargement modèle + génération
-- postprocess.py  : extraction JSON, normalisation, merge, confidence
-- guardrails.py   : heuristiques déterministes post-génération
-- strategies.py   : orchestration single/chunked/header-first/etc.
-"""
-
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
 import traceback
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
-from .models import PatentExtraction, PatentMetadata
-from .prompt_templates import (
-    PROMPT_EXTRACTION_V1,
-    PROMPT_EXTRACTION_V2,
-    PROMPT_EXTRACTION_V3,
-    PROMPT_EXTRACTION_V4,
-)
+from . import guardrails as guardrails_mod
 from . import postprocess as postprocess_mod
 from . import runtime as runtime_mod
 from . import strategies as strategy_mod
-from . import guardrails as guardrails_mod
-from ..utils.device_utils import get_device
-
-# Compatibility re-exports used by tests and monkeypatching.
-AutoModelForCausalLM = runtime_mod.AutoModelForCausalLM
-BitsAndBytesConfig = runtime_mod.BitsAndBytesConfig
-Mistral3ForCausalLM = runtime_mod.Mistral3ForCausalLM
-Mistral3ForConditionalGeneration = runtime_mod.Mistral3ForConditionalGeneration
-_HAS_MLX = runtime_mod.HAS_MLX
+from .config import ExtractionConfig, ProfileConfig
+from .models import PatentExtraction, PatentMetadata
+from .profiles import DEFAULT_PROFILE_NAME, load_profile
+from .prompt_templates import JSON_ONLY_SUFFIX, PROMPT_BY_ID, PROMPT_EXTRACTION_V4
 
 
-_PROMPT_BY_ID: Dict[str, str] = {
-    "v1": PROMPT_EXTRACTION_V1,
-    "v2": PROMPT_EXTRACTION_V2,
-    "v3": PROMPT_EXTRACTION_V3,
-    "v4": PROMPT_EXTRACTION_V4,
-}
-
-_GUARDRAIL_PROFILES = guardrails_mod.GUARDRAIL_PROFILES
-
-_JSON_ONLY_SUFFIX = "\n\nNow output ONLY the JSON object, without any extra text.\n"
+_PROMPT_BY_ID: Dict[str, str] = dict(PROMPT_BY_ID)
+_JSON_ONLY_SUFFIX = JSON_ONLY_SUFFIX
 
 
-def _sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _jsonable(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def _non_negative_float(value: Any) -> Optional[float]:
@@ -77,13 +56,14 @@ def _vllm_request_timing(output: Any) -> Dict[str, float]:
     finished = _non_negative_float(getattr(metrics, "finished_time", None))
 
     timing: Dict[str, float] = {}
-
     if arrival is not None and finished is not None and finished >= arrival:
         timing["t_vllm_request_s"] = finished - arrival
     if arrival is not None and first_token is not None and first_token >= arrival:
         timing["t_vllm_ttft_s"] = first_token - arrival
     if first_token is not None and finished is not None and finished >= first_token:
         timing["t_vllm_decode_s"] = finished - first_token
+    if arrival is not None and first_scheduled is not None and first_scheduled >= arrival:
+        timing.setdefault("t_vllm_queue_s", first_scheduled - arrival)
 
     for key, attr in (
         ("t_vllm_queue_s", "time_in_queue"),
@@ -106,28 +86,17 @@ def _iter_batches(rows: List[Dict[str, Any]], batch_size: Optional[int]) -> List
     return [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]
 
 
+@dataclass(frozen=True)
+class RunArtifacts:
+    run_dir: Path
+    preds_path: Path
+    run_meta_path: Path
+    raw_outputs_dir: Optional[Path]
+    docs_written: int
+    wall_s: float
+
+
 class PatentExtractor:
-    """
-    Extracteur de métadonnées de brevets à partir de textes OCR.
-
-    Supporte:
-    - MLX (Apple Silicon)
-    - PyTorch (CPU/CUDA)
-    """
-
-    _config_name = staticmethod(runtime_mod.config_name)
-    _config_model_type = staticmethod(runtime_mod.config_model_type)
-    _resolve_torch_dtype = runtime_mod.resolve_torch_dtype
-    _resolve_attn_implementation = staticmethod(runtime_mod.resolve_attn_implementation)
-    _build_quantization_config = staticmethod(runtime_mod.build_quantization_config)
-    _resolve_cache_implementation = staticmethod(runtime_mod.resolve_cache_implementation)
-    _build_generate_kwargs = staticmethod(runtime_mod.build_generate_kwargs)
-    _resolve_vllm_dtype = staticmethod(runtime_mod.resolve_vllm_dtype)
-    _build_vllm_sampling_params = staticmethod(runtime_mod.build_vllm_sampling_params)
-    _is_mistral31_model = runtime_mod.is_mistral31_model
-    _load_tokenizer = runtime_mod.load_tokenizer
-    _generate = runtime_mod.generate_text
-
     _first_non_empty = staticmethod(postprocess_mod.first_non_empty)
     _longest_non_empty = staticmethod(postprocess_mod.longest_non_empty)
     _to_date = staticmethod(postprocess_mod.to_date)
@@ -147,8 +116,6 @@ class PatentExtractor:
     _fix_duplicate_dates = staticmethod(postprocess_mod.fix_duplicate_dates)
     _parse_and_validate = staticmethod(postprocess_mod.parse_and_validate)
 
-    _looks_like_de_legacy_self_applicant_case = staticmethod(guardrails_mod.looks_like_de_legacy_self_applicant_case)
-
     _truncate_ocr = strategy_mod.truncate_ocr
     _should_use_chunked = strategy_mod.should_use_chunked
     _split_text_chunks = strategy_mod.split_text_chunks
@@ -164,109 +131,81 @@ class PatentExtractor:
     _run_strategy = strategy_mod.run_strategy
     _timing_dict = strategy_mod.timing_dict
 
+    _generate = runtime_mod.generate_text
+    _build_vllm_sampling_params = staticmethod(runtime_mod.build_sampling_params)
+
     def __init__(
         self,
-        model_name: Optional[str] = None,
-        backend: Literal["auto", "mlx", "pytorch", "vllm"] = "auto",
-        device: Optional[str] = None,
-        device_map: Optional[str] = None,
-        torch_dtype: Literal["auto", "bf16", "fp16", "fp32"] = "auto",
-        quantization: Literal["none", "bnb_8bit", "bnb_4bit"] = "none",
-        attn_implementation: Literal["auto", "sdpa", "flash_attention_2"] = "auto",
-        cache_implementation: Literal["auto", "dynamic", "static", "offloaded", "offloaded_static"] = "auto",
-        vllm_enable_prefix_caching: bool = False,
-        vllm_tensor_parallel_size: int = 1,
-        vllm_gpu_memory_utilization: float = 0.9,
-        vllm_max_model_len: Optional[int] = None,
-        vllm_swap_space: float = 4.0,
-        vllm_enforce_eager: bool = False,
-        vllm_doc_batch_size: Optional[int] = 32,
-        vllm_sort_by_prompt_length: bool = True,
-        vllm_tokenizer_mode: Literal["auto", "mistral"] = "auto",
+        *,
+        model_name: str,
+        torch_dtype: str = "auto",
+        quantization: str = "none",
         prompt_id: Optional[str] = None,
         prompt_template: Optional[str] = None,
-        guardrail_profile: Literal["auto", "off", "de_legacy_self_applicant"] = "auto",
+        guardrail_profile: str = "auto",
         max_ocr_chars: int = 10000,
         max_new_tokens: int = 1024,
         temperature: float = 0.0,
         do_sample: bool = False,
-        extraction_mode: Literal["single", "chunked", "auto"] = "auto",
+        extraction_mode: str = "auto",
         chunk_size_chars: int = 7000,
         chunk_overlap_chars: int = 800,
         extraction_passes: int = 2,
-        strategy: Literal[
-            "baseline",
-            "chunked",
-            "header_first",
-            "two_pass_targeted",
-            "self_consistency",
-        ] = "baseline",
+        strategy: str = "baseline",
         header_lines: int = 30,
         targeted_rerun_threshold: float = 0.6,
         self_consistency_n: int = 2,
         self_consistency_temp: float = 0.2,
-        merge_policy: Literal["prefer_non_null", "prefer_first", "prefer_last", "vote_majority"] = "prefer_non_null",
+        merge_policy: str = "prefer_non_null",
         save_strategy_meta: bool = False,
         save_raw_output: bool = False,
-        timings: Literal["off", "basic", "detailed"] = "off",
+        timings: str = "off",
+        enable_prefix_caching: bool = False,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: Optional[int] = None,
+        swap_space: float = 4.0,
+        enforce_eager: bool = False,
+        doc_batch_size: Optional[int] = 32,
+        sort_by_prompt_length: bool = True,
+        tokenizer_mode: str = "auto",
     ):
-        self.model_name = model_name or os.getenv("HF_MODEL", "mlx-community/Mistral-7B-Instruct-v0.3")
-        self.max_ocr_chars = max_ocr_chars
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.do_sample = do_sample
-        self.extraction_mode = extraction_mode
+        self.model_name = model_name
+        self.backend = "vllm"
+        self.torch_dtype = str(torch_dtype).strip().lower()
+        self.quantization = str(quantization or "none").strip().lower()
+        self.max_ocr_chars = int(max_ocr_chars)
+        self.max_new_tokens = int(max_new_tokens)
+        self.temperature = float(temperature)
+        self.do_sample = bool(do_sample)
+        self.extraction_mode = str(extraction_mode)
         self.chunk_size_chars = int(chunk_size_chars)
         self.chunk_overlap_chars = int(chunk_overlap_chars)
         self.extraction_passes = int(extraction_passes)
-        self.strategy = strategy
+        self.strategy = str(strategy)
         self.header_lines = int(header_lines)
         self.targeted_rerun_threshold = float(targeted_rerun_threshold)
         self.self_consistency_n = int(self_consistency_n)
         self.self_consistency_temp = float(self_consistency_temp)
-        self.merge_policy = merge_policy
+        self.merge_policy = str(merge_policy)
         self.save_strategy_meta = bool(save_strategy_meta)
         self.save_raw_output = bool(save_raw_output)
-        self.timings = timings
-        self.torch_dtype = str(torch_dtype).strip().lower()
-        self.quantization = str(quantization).strip().lower()
-        self.attn_implementation = str(attn_implementation).strip().lower()
-        self.cache_implementation = str(cache_implementation).strip().lower()
-        self.vllm_enable_prefix_caching = bool(vllm_enable_prefix_caching)
-        self.vllm_tensor_parallel_size = int(vllm_tensor_parallel_size)
-        self.vllm_gpu_memory_utilization = float(vllm_gpu_memory_utilization)
-        self.vllm_max_model_len = None if vllm_max_model_len is None else int(vllm_max_model_len)
-        self.vllm_swap_space = float(vllm_swap_space)
-        self.vllm_enforce_eager = bool(vllm_enforce_eager)
-        self.vllm_doc_batch_size = None if vllm_doc_batch_size is None else int(vllm_doc_batch_size)
-        self.vllm_sort_by_prompt_length = bool(vllm_sort_by_prompt_length)
-        self.vllm_tokenizer_mode = str(vllm_tokenizer_mode).strip().lower()
+        self.timings = str(timings)
+        self.enable_prefix_caching = bool(enable_prefix_caching)
+        self.tensor_parallel_size = int(tensor_parallel_size)
+        self.gpu_memory_utilization = float(gpu_memory_utilization)
+        self.max_model_len = None if max_model_len is None else int(max_model_len)
+        self.swap_space = float(swap_space)
+        self.enforce_eager = bool(enforce_eager)
+        self.doc_batch_size = None if doc_batch_size is None else int(doc_batch_size)
+        self.sort_by_prompt_length = bool(sort_by_prompt_length)
+        self.tokenizer_mode = str(tokenizer_mode).strip().lower()
         self.guardrail_profile = str(guardrail_profile).strip().lower()
 
         if self.torch_dtype not in {"auto", "bf16", "fp16", "fp32"}:
             raise ValueError("torch_dtype must be one of: auto|bf16|fp16|fp32")
-        if self.quantization not in {"none", "bnb_8bit", "bnb_4bit"}:
-            raise ValueError("quantization must be one of: none|bnb_8bit|bnb_4bit")
-        if self.attn_implementation not in {"auto", "sdpa", "flash_attention_2"}:
-            raise ValueError("attn_implementation must be one of: auto|sdpa|flash_attention_2")
-        if self.cache_implementation not in {"auto", "dynamic", "static", "offloaded", "offloaded_static"}:
-            raise ValueError(
-                "cache_implementation must be one of: auto|dynamic|static|offloaded|offloaded_static"
-            )
-        if self.vllm_tensor_parallel_size < 1:
-            raise ValueError("vllm_tensor_parallel_size must be >= 1")
-        if not (0.0 < self.vllm_gpu_memory_utilization <= 1.0):
-            raise ValueError("vllm_gpu_memory_utilization must be in (0, 1]")
-        if self.vllm_max_model_len is not None and self.vllm_max_model_len < 1:
-            raise ValueError("vllm_max_model_len must be >= 1")
-        if self.vllm_swap_space < 0.0:
-            raise ValueError("vllm_swap_space must be >= 0")
-        if self.vllm_doc_batch_size is not None and self.vllm_doc_batch_size < 1:
-            raise ValueError("vllm_doc_batch_size must be >= 1")
-        if self.vllm_tokenizer_mode not in {"auto", "mistral"}:
-            raise ValueError("vllm_tokenizer_mode must be one of: auto|mistral")
-        if self.guardrail_profile not in _GUARDRAIL_PROFILES:
-            raise ValueError(f"guardrail_profile must be one of: {sorted(_GUARDRAIL_PROFILES)}")
+        if self.guardrail_profile not in guardrails_mod.GUARDRAIL_PROFILES:
+            raise ValueError(f"guardrail_profile must be one of: {sorted(guardrails_mod.GUARDRAIL_PROFILES)}")
         if self.chunk_size_chars <= 0:
             raise ValueError("chunk_size_chars must be > 0")
         if self.chunk_overlap_chars < 0:
@@ -283,6 +222,10 @@ class PatentExtractor:
             raise ValueError("self_consistency_n must be >= 1")
         if self.self_consistency_temp < 0.0:
             raise ValueError("self_consistency_temp must be >= 0")
+        if self.timings not in {"off", "basic", "detailed"}:
+            raise ValueError("timings must be one of: off|basic|detailed")
+        if self.tokenizer_mode not in {"auto", "mistral"}:
+            raise ValueError("tokenizer_mode must be one of: auto|mistral")
 
         self.prompt_suffix = _JSON_ONLY_SUFFIX
         self.prompt_id = prompt_id
@@ -292,40 +235,11 @@ class PatentExtractor:
             self.prompt_template = _PROMPT_BY_ID[self.prompt_id]
             self.prompt_template_source = f"prompt_id:{self.prompt_id}"
         else:
-            self.prompt_template = prompt_template or PROMPT_EXTRACTION_V2
-            self.prompt_template_source = "inline_template" if prompt_template else "default:v2"
-
+            self.prompt_template = prompt_template or PROMPT_EXTRACTION_V4
+            self.prompt_template_source = "inline_template" if prompt_template else "default:v4"
         if "{text}" not in self.prompt_template:
             raise ValueError("Le template doit contenir le placeholder {text}")
         self.prompt_hash = _sha256(self.prompt_template + self.prompt_suffix)
-
-        if backend == "auto":
-            self.backend = "mlx" if _HAS_MLX else "pytorch"
-        else:
-            self.backend = backend
-            if self.backend == "mlx" and not _HAS_MLX:
-                raise ImportError("MLX n'est pas installé. Installe avec: pip install mlx-lm")
-        if self.backend == "vllm":
-            if self.quantization != "none":
-                raise ValueError("quantization is not yet supported with backend='vllm' in this extractor")
-            if self.attn_implementation != "auto":
-                raise ValueError("attn_implementation is not supported with backend='vllm'")
-            if self.cache_implementation != "auto":
-                raise ValueError("cache_implementation is not supported with backend='vllm'")
-        elif self.backend != "pytorch":
-            if self.quantization != "none":
-                raise ValueError("quantization is only supported with backend='pytorch'")
-            if self.attn_implementation != "auto":
-                raise ValueError("attn_implementation is only supported with backend='pytorch'")
-            if self.cache_implementation != "auto":
-                raise ValueError("cache_implementation is only supported with backend='pytorch'")
-
-        self.device = device or get_device()
-        self.device_map = device_map or ("cuda" if self.device == "cuda" else "cpu")
-        if self.backend == "pytorch" and self.device == "mps":
-            print("⚠️  MPS backend instable → fallback CPU")
-            self.device = "cpu"
-            self.device_map = "cpu"
 
         self._last_timing: Optional[Dict[str, float]] = None
         self._last_raw_output: Optional[Any] = None
@@ -333,28 +247,21 @@ class PatentExtractor:
 
         self.model = None
         self.tokenizer = None
-        self.pipe = None
-        self.pipeline_task: Optional[str] = None
-        self._debug_gen_logged = False
-
         self._load_model()
 
-    @staticmethod
-    def _resolve_model_route(config: Optional[Any]) -> Dict[str, Any]:
-        return runtime_mod.resolve_model_route(
-            config,
-            auto_model_cls=AutoModelForCausalLM,
-            mistral3_causal_cls=Mistral3ForCausalLM,
-            mistral3_conditional_cls=Mistral3ForConditionalGeneration,
-        )
-
     def _load_model(self) -> None:
-        runtime_mod.load_model_into(
-            self,
-            resolve_model_route_fn=self._resolve_model_route,
-            resolve_torch_dtype_fn=self._resolve_torch_dtype,
-            load_tokenizer_fn=self._load_tokenizer,
-        )
+        print("🧠 Backend: vllm")
+        print(f"📦 Model: {self.model_name}")
+        runtime_mod.load_model(self)
+
+    @staticmethod
+    def _render_prompt_template(template: str, text: str) -> str:
+        if "{text}" not in template:
+            raise ValueError("Le template doit contenir le placeholder {text}")
+        sentinel = "__PATENT_EXTRACTION_TEXT_PLACEHOLDER__"
+        rendered = template.replace("{text}", sentinel)
+        rendered = rendered.replace("{{", "{").replace("}}", "}")
+        return rendered.replace(sentinel, text)
 
     def set_prompt_template(self, template: str) -> None:
         if "{text}" not in template:
@@ -364,35 +271,19 @@ class PatentExtractor:
         self.prompt_template_source = "inline_template"
         self.prompt_hash = _sha256(self.prompt_template + self.prompt_suffix)
 
-    @staticmethod
-    def _render_prompt_template(template: str, text: str) -> str:
-        """Render `{text}` without treating every JSON brace as a format token."""
-        if "{text}" not in template:
-            raise ValueError("Le template doit contenir le placeholder {text}")
-        sentinel = "__PATENT_PIPELINE_TEXT_PLACEHOLDER__"
-        rendered = template.replace("{text}", sentinel)
-        rendered = rendered.replace("{{", "{").replace("}}", "}")
-        return rendered.replace(sentinel, text)
-
-    def _should_apply_de_legacy_self_applicant_guardrail(self) -> bool:
-        return guardrails_mod.should_apply_de_legacy_self_applicant_guardrail(
-            prompt_id=getattr(self, "prompt_id", None),
-            guardrail_profile=getattr(self, "guardrail_profile", "auto"),
-        )
-
     def _apply_de_legacy_self_applicant_guardrail(self, metadata: PatentMetadata, ocr_text: str) -> PatentMetadata:
         return guardrails_mod.apply_de_legacy_self_applicant_guardrail(
             metadata,
             ocr_text,
-            prompt_id=getattr(self, "prompt_id", None),
-            guardrail_profile=getattr(self, "guardrail_profile", "auto"),
+            prompt_id=self.prompt_id,
+            guardrail_profile=self.guardrail_profile,
         )
 
     def extract(self, ocr_text: str, debug: bool = False) -> PatentExtraction:
         try:
             metadata, strategy_meta, raw_output = self._run_strategy(ocr_text, debug=debug)
-        except Exception as e:
-            print(f"⚠️ Strategy '{self.strategy}' failed ({e.__class__.__name__}). Fallback to baseline.")
+        except Exception as exc:
+            print(f"⚠️ Strategy '{self.strategy}' failed ({exc.__class__.__name__}). Fallback to baseline.")
             metadata, timing, raw_output, base_meta = self._run_baseline_strategy(ocr_text, debug=debug)
             strategy_meta = {
                 **base_meta,
@@ -409,51 +300,28 @@ class PatentExtractor:
         self._last_timing = strategy_meta.get("timing") or None
         self._last_raw_output = raw_output
         self._last_strategy_meta = strategy_meta
-        return PatentExtraction(
-            ocr_text=ocr_text,
-            model=self.model_name,
-            prediction=metadata,
-        )
+        return PatentExtraction(ocr_text=ocr_text, model=self.model_name, prediction=metadata)
 
     def extract_from_file(self, txt_path: Path, raw_output_dir: Optional[Path] = None) -> dict:
         t_file0 = time.perf_counter() if self.timings != "off" else None
-
         try:
             t_read0 = time.perf_counter() if self.timings == "detailed" else None
             ocr_text = txt_path.read_text(encoding="utf-8", errors="ignore")
             t_read1 = time.perf_counter() if self.timings == "detailed" else None
 
             if not ocr_text.strip():
-                rec = {
-                    "file_name": txt_path.name,
-                    "ocr_path": str(txt_path),
-                    "error": "empty_ocr",
-                    "strategy_used": self.strategy,
-                    "confidence_score": 0.0,
-                }
-                if self.prompt_id is not None:
-                    rec["prompt_id"] = self.prompt_id
-                rec["prompt_hash"] = self.prompt_hash
-
-                if self.timings != "off" and t_file0 is not None:
-                    timing = {"t_total_file_s": time.perf_counter() - t_file0}
-                    if self.timings == "detailed" and t_read0 is not None and t_read1 is not None:
-                        timing["t_read_s"] = max(0.0, t_read1 - t_read0)
-                    rec["timing"] = timing
-
-                return rec
+                return self._make_empty_ocr_record(txt_path, t_file0=t_file0, t_read0=t_read0, t_read1=t_read1)
 
             extraction = self.extract(ocr_text)
             record = extraction.model_dump(mode="json")
             record["file_name"] = txt_path.name
             record["ocr_path"] = str(txt_path)
-
             if isinstance(record.get("prediction"), dict):
                 record["prediction"]["identifier"] = txt_path.stem.split("_")[0]
-
             if self.prompt_id is not None:
                 record["prompt_id"] = self.prompt_id
             record["prompt_hash"] = self.prompt_hash
+
             strategy_meta = self._last_strategy_meta or {}
             record["strategy_used"] = strategy_meta.get("strategy_used", "baseline")
             record["confidence_score"] = strategy_meta.get("confidence_score", 0.0)
@@ -469,6 +337,8 @@ class PatentExtractor:
                     record["fallback_to_full"] = strategy_meta.get("fallback_to_full")
                 if "self_consistency_variance" in strategy_meta:
                     record["self_consistency_variance"] = strategy_meta.get("self_consistency_variance")
+                if "vllm_doc_batch_size_used" in strategy_meta:
+                    record["vllm_doc_batch_size_used"] = strategy_meta.get("vllm_doc_batch_size_used")
 
             if self.timings != "off":
                 timing_out: Dict[str, float] = {}
@@ -498,66 +368,18 @@ class PatentExtractor:
                     record.pop("raw_output", None)
 
             return record
-
-        except Exception as e:
-            print(f"⚠️ Erreur sur {txt_path.name}: {e}")
+        except Exception as exc:
+            print(f"⚠️ Erreur sur {txt_path.name}: {exc}")
             traceback.print_exc()
-
-            rec = {
-                "file_name": txt_path.name,
-                "ocr_path": str(txt_path),
-                "error": f"exception: {e.__class__.__name__}",
-                "error_type": e.__class__.__name__,
-                "error_detail": str(e),
-                "strategy_used": self.strategy,
-                "confidence_score": 0.0,
-            }
-            if self.prompt_id is not None:
-                rec["prompt_id"] = self.prompt_id
-            rec["prompt_hash"] = self.prompt_hash
-
-            if self.timings != "off" and t_file0 is not None:
-                rec["timing"] = {"t_total_file_s": max(0.0, time.perf_counter() - t_file0)}
-
-            return rec
-
-    def batch_extract(
-        self,
-        txt_dir: Path,
-        out_file: Path,
-        limit: Optional[int] = None,
-        raw_output_dir: Optional[Path] = None,
-    ) -> int:
-        if self.backend == "vllm":
-            return self._batch_extract_vllm(
-                txt_dir=txt_dir,
-                out_file=out_file,
-                limit=limit,
-                raw_output_dir=raw_output_dir,
+            return self._make_exception_record(
+                txt_path,
+                t_file0=t_file0,
+                error_type=exc.__class__.__name__,
+                error_detail=str(exc),
             )
 
-        txt_files = sorted(txt_dir.glob("*.txt"))
-        total = len(txt_files)
-
-        if limit is not None and limit < total:
-            txt_files = txt_files[:limit]
-            print(f"⚙️ Limitation à {limit} documents (sur {total} total)")
-        else:
-            print(f"⚙️ Traitement de {total} documents")
-
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        count = 0
-
-        with open(out_file, "w", encoding="utf-8") as f_out:
-            for txt_path in tqdm(txt_files, desc="🧠 Batch extraction", unit="doc"):
-                record = self.extract_from_file(txt_path, raw_output_dir=raw_output_dir)
-                f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                count += 1
-
-        print(f"✅ Extraction complète → {count} documents traités")
-        print(f"📊 Résultats: {out_file}")
-
-        return count
+    def batch_extract(self, txt_dir: Path, out_file: Path, limit: Optional[int] = None, raw_output_dir: Optional[Path] = None) -> int:
+        return self._batch_extract_vllm(txt_dir=txt_dir, out_file=out_file, limit=limit, raw_output_dir=raw_output_dir)
 
     def _make_empty_ocr_record(
         self,
@@ -632,10 +454,8 @@ class PatentExtractor:
             "strategy_used": strategy_meta.get("strategy_used", self.strategy),
             "confidence_score": strategy_meta.get("confidence_score", 0.0),
         }
-
         if isinstance(record.get("prediction"), dict):
             record["prediction"]["identifier"] = txt_path.stem.split("_")[0]
-
         if self.prompt_id is not None:
             record["prompt_id"] = self.prompt_id
 
@@ -727,7 +547,6 @@ class PatentExtractor:
         suffix = prompt_suffix_override if prompt_suffix_override is not None else self.prompt_suffix
         prompt = self._render_prompt_template(self.prompt_template, text_for_prompt) + suffix
         t_prompt1 = time.perf_counter() if self.timings == "detailed" else None
-
         return {
             **doc_row,
             "prompt": prompt,
@@ -751,19 +570,17 @@ class PatentExtractor:
         for doc_row in tqdm(doc_rows, desc=prep_desc, unit="doc"):
             original_index = int(doc_row["original_index"])
             ocr_text = str(doc_row["ocr_text"])
-            extraction_mode = getattr(self, "extraction_mode", "auto")
-            max_ocr_chars = int(getattr(self, "max_ocr_chars", 10000))
             if force_chunked:
                 use_chunked = True
-            elif extraction_mode == "chunked":
+            elif self.extraction_mode == "chunked":
                 use_chunked = True
-            elif extraction_mode == "single":
+            elif self.extraction_mode == "single":
                 use_chunked = False
             else:
-                use_chunked = len(ocr_text) > max_ocr_chars
+                use_chunked = len(ocr_text) > self.max_ocr_chars
+
             candidate_order = 0
             chunk_count = 0
-
             if use_chunked:
                 for offset in self._chunk_offsets():
                     for chunk in self._split_text_chunks(ocr_text, offset=offset):
@@ -797,9 +614,7 @@ class PatentExtractor:
                 "use_chunked": use_chunked,
                 "pass_count": chunk_count,
                 "chunks_count": chunk_count,
-                "merge_policy_used": (merge_policy if merge_policy is not None else "legacy_baseline")
-                if use_chunked
-                else "n/a_single",
+                "merge_policy_used": (merge_policy if merge_policy is not None else "legacy_baseline") if use_chunked else "n/a_single",
             }
 
         return prompt_rows, doc_plans
@@ -817,24 +632,21 @@ class PatentExtractor:
 
         prompt_results_by_doc: Dict[int, List[Dict[str, Any]]] = {}
         work_rows = list(prompt_rows)
-        if self.vllm_sort_by_prompt_length:
+        if self.sort_by_prompt_length:
             work_rows.sort(key=lambda row: len(row["prompt"]), reverse=True)
 
-        try:
-            sampling_params = self._build_vllm_sampling_params(
-                self,
-                temperature_override=temperature_override,
-                do_sample_override=do_sample_override,
-            )
-        except TypeError:
-            sampling_params = self._build_vllm_sampling_params(self)
+        sampling_params = self._build_vllm_sampling_params(
+            self,
+            temperature_override=temperature_override,
+            do_sample_override=do_sample_override,
+        )
 
         infer_bar = tqdm(total=len(work_rows), desc=infer_desc, unit="doc")
         batch_generate_total_t = 0.0
         microbatch_id = 0
 
         try:
-            for batch_rows in _iter_batches(work_rows, self.vllm_doc_batch_size):
+            for batch_rows in _iter_batches(work_rows, self.doc_batch_size):
                 prompts = [row["prompt"] for row in batch_rows]
                 outputs: List[Any] = []
                 microbatch_generate_t = 0.0
@@ -864,15 +676,12 @@ class PatentExtractor:
                         json_str = self._extract_json(raw_output)
                         metadata = self._parse_and_validate(json_str)
                         metadata = self._apply_de_legacy_self_applicant_guardrail(metadata, str(row.get("ocr_text") or ""))
+                        prompt_result = {"metadata": metadata, "raw_output": raw_output}
+                    except Exception as exc:
                         prompt_result = {
-                            "metadata": metadata,
-                            "raw_output": raw_output,
-                        }
-                    except Exception as e:
-                        prompt_result = {
-                            "error": f"exception: {e.__class__.__name__}",
-                            "error_type": e.__class__.__name__,
-                            "error_detail": str(e),
+                            "error": f"exception: {exc.__class__.__name__}",
+                            "error_type": exc.__class__.__name__,
+                            "error_detail": str(exc),
                             "raw_output": raw_output,
                         }
 
@@ -924,11 +733,7 @@ class PatentExtractor:
 
         return prompt_results_by_doc, batch_generate_total_t
 
-    def _aggregate_vllm_doc_timing(
-        self,
-        doc_plan: Dict[str, Any],
-        prompt_results: List[Dict[str, Any]],
-    ) -> Dict[str, float]:
+    def _aggregate_vllm_doc_timing(self, doc_plan: Dict[str, Any], prompt_results: List[Dict[str, Any]]) -> Dict[str, float]:
         if self.timings == "off":
             return {}
 
@@ -975,7 +780,6 @@ class PatentExtractor:
         prebatch_wait_s = float(timing_out.get("t_prebatch_wait_s", 0.0))
         request_s = float(timing_out.get("t_vllm_request_s", 0.0))
         parse_s = float(timing_out.get("t_parse_s", 0.0))
-
         total_file_s = read_s + prompt_s + prebatch_wait_s + request_s + parse_s
         if total_file_s > 0.0:
             timing_out["t_total_file_s"] = total_file_s
@@ -1012,10 +816,7 @@ class PatentExtractor:
 
         results: Dict[int, Dict[str, Any]] = {}
         for original_index, doc_plan in doc_plans.items():
-            prompt_results = sorted(
-                prompt_results_by_doc.get(original_index, []),
-                key=lambda item: int(item.get("candidate_order", 0)),
-            )
+            prompt_results = sorted(prompt_results_by_doc.get(original_index, []), key=lambda item: int(item.get("candidate_order", 0)))
             candidates: List[PatentMetadata] = []
             raw_outputs: List[Any] = []
             errors: List[Dict[str, Any]] = []
@@ -1028,7 +829,6 @@ class PatentExtractor:
                     errors.append(prompt_result)
 
             timing = self._aggregate_vllm_doc_timing(doc_plan, prompt_results)
-
             if not candidates:
                 if errors:
                     first_error = errors[0]
@@ -1056,19 +856,11 @@ class PatentExtractor:
                 metadata = candidates[0]
                 raw_output = raw_outputs[0] if raw_outputs else None
 
-            results[original_index] = {
-                **doc_plan,
-                "metadata": metadata,
-                "raw_output": raw_output,
-                "timing": timing,
-            }
+            results[original_index] = {**doc_plan, "metadata": metadata, "raw_output": raw_output, "timing": timing}
 
         return results, batch_generate_total_t
 
-    def _run_vllm_batched_baseline_strategy(
-        self,
-        doc_rows: List[Dict[str, Any]],
-    ) -> Tuple[Dict[int, Dict[str, Any]], float]:
+    def _run_vllm_batched_baseline_strategy(self, doc_rows: List[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], float]:
         base_results, batch_generate_total_t = self._run_vllm_generate_plan(
             doc_rows,
             prep_desc="🧠 Préparation prompts vLLM",
@@ -1076,7 +868,6 @@ class PatentExtractor:
             force_chunked=False,
             merge_policy=None,
         )
-
         results: Dict[int, Dict[str, Any]] = {}
         for original_index, result in base_results.items():
             if "metadata" not in result:
@@ -1092,17 +883,13 @@ class PatentExtractor:
                     "header_first_used": False,
                     "merge_policy_used": result["merge_policy_used"],
                     "self_consistency_n_used": 1,
-                    "vllm_doc_batch_size_used": self.vllm_doc_batch_size or len(doc_rows),
+                    "vllm_doc_batch_size_used": self.doc_batch_size or len(doc_rows),
                     "timing": result.get("timing") or {},
                 },
             }
-
         return results, batch_generate_total_t
 
-    def _run_vllm_batched_chunked_strategy(
-        self,
-        doc_rows: List[Dict[str, Any]],
-    ) -> Tuple[Dict[int, Dict[str, Any]], float]:
+    def _run_vllm_batched_chunked_strategy(self, doc_rows: List[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], float]:
         base_results, batch_generate_total_t = self._run_vllm_generate_plan(
             doc_rows,
             prep_desc="🧠 Préparation chunks vLLM",
@@ -1110,7 +897,6 @@ class PatentExtractor:
             force_chunked=True,
             merge_policy=self.merge_policy,
         )
-
         results: Dict[int, Dict[str, Any]] = {}
         for original_index, result in base_results.items():
             if "metadata" not in result:
@@ -1126,17 +912,13 @@ class PatentExtractor:
                     "header_first_used": False,
                     "merge_policy_used": self.merge_policy,
                     "self_consistency_n_used": 1,
-                    "vllm_doc_batch_size_used": self.vllm_doc_batch_size or len(doc_rows),
+                    "vllm_doc_batch_size_used": self.doc_batch_size or len(doc_rows),
                     "timing": result.get("timing") or {},
                 },
             }
-
         return results, batch_generate_total_t
 
-    def _run_vllm_batched_header_first_strategy(
-        self,
-        doc_rows: List[Dict[str, Any]],
-    ) -> Tuple[Dict[int, Dict[str, Any]], float]:
+    def _run_vllm_batched_header_first_strategy(self, doc_rows: List[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], float]:
         header_rows = []
         for doc_row in doc_rows:
             lines = str(doc_row["ocr_text"]).splitlines()
@@ -1220,9 +1002,7 @@ class PatentExtractor:
                     }
                     continue
                 merged = header_meta
-                timing = {
-                    f"header_{key}": value for key, value in (header_result.get("timing") or {}).items()
-                }
+                timing = {f"header_{key}": value for key, value in (header_result.get("timing") or {}).items()}
                 pass_count = 1
                 chunks_count = 1
                 raw_output = {"header": header_raw}
@@ -1241,17 +1021,13 @@ class PatentExtractor:
                     "missing_critical_fields": missing,
                     "merge_policy_used": self.merge_policy,
                     "self_consistency_n_used": 1,
-                    "vllm_doc_batch_size_used": self.vllm_doc_batch_size or len(doc_rows),
+                    "vllm_doc_batch_size_used": self.doc_batch_size or len(doc_rows),
                     "timing": timing,
                 },
             }
-
         return results, batch_generate_total_t
 
-    def _run_vllm_batched_two_pass_targeted_strategy(
-        self,
-        doc_rows: List[Dict[str, Any]],
-    ) -> Tuple[Dict[int, Dict[str, Any]], float]:
+    def _run_vllm_batched_two_pass_targeted_strategy(self, doc_rows: List[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], float]:
         pass1_results, batch_generate_total_t = self._run_vllm_generate_plan(
             doc_rows,
             prep_desc="🧠 Préparation pass1 vLLM",
@@ -1264,7 +1040,6 @@ class PatentExtractor:
         pass1_confidence: Dict[int, float] = {}
         pass1_subscores: Dict[int, Dict[str, float]] = {}
         rerun_by_doc: Dict[int, bool] = {}
-
         for doc_row in doc_rows:
             original_index = int(doc_row["original_index"])
             pass1_result = pass1_results.get(original_index, {})
@@ -1340,9 +1115,7 @@ class PatentExtractor:
                     }
                     continue
                 merged = pass1_result["metadata"]
-                timing = {
-                    f"pass1_{key}": value for key, value in (pass1_result.get("timing") or {}).items()
-                }
+                timing = {f"pass1_{key}": value for key, value in (pass1_result.get("timing") or {}).items()}
                 pass_count = int(pass1_result.get("pass_count", 1))
                 chunks_count = int(pass1_result.get("chunks_count", 1))
                 raw_output = {"pass1": pass1_result.get("raw_output")}
@@ -1362,21 +1135,16 @@ class PatentExtractor:
                     "header_first_used": False,
                     "merge_policy_used": self.merge_policy,
                     "self_consistency_n_used": 1,
-                    "vllm_doc_batch_size_used": self.vllm_doc_batch_size or len(doc_rows),
+                    "vllm_doc_batch_size_used": self.doc_batch_size or len(doc_rows),
                     "timing": timing,
                 },
             }
-
         return results, batch_generate_total_t
 
-    def _run_vllm_batched_self_consistency_strategy(
-        self,
-        doc_rows: List[Dict[str, Any]],
-    ) -> Tuple[Dict[int, Dict[str, Any]], float]:
+    def _run_vllm_batched_self_consistency_strategy(self, doc_rows: List[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], float]:
         n = max(1, self.self_consistency_n)
         pass_results_list: List[Dict[int, Dict[str, Any]]] = []
         batch_generate_total_t = 0.0
-
         for pass_index in range(n):
             pass_results, pass_generate_t = self._run_vllm_generate_plan(
                 doc_rows,
@@ -1401,7 +1169,6 @@ class PatentExtractor:
             "classification",
             "industrial_field",
         ]
-
         for doc_row in doc_rows:
             original_index = int(doc_row["original_index"])
             candidates: List[PatentMetadata] = []
@@ -1434,11 +1201,7 @@ class PatentExtractor:
                 continue
 
             t_merge0 = time.perf_counter() if self.timings != "off" else None
-            merged = self._merge_metadata_candidates(
-                candidates,
-                policy="vote_majority",
-                fallback_policy="prefer_non_null",
-            )
+            merged = self._merge_metadata_candidates(candidates, policy="vote_majority", fallback_policy="prefer_non_null")
             t_merge1 = time.perf_counter() if self.timings != "off" else None
 
             agg_timing: Dict[str, float] = {}
@@ -1468,17 +1231,13 @@ class PatentExtractor:
                     "self_consistency_temp_used": self.self_consistency_temp,
                     "self_consistency_variance": variance_mean,
                     "self_consistency_variance_by_field": variance_by_field,
-                    "vllm_doc_batch_size_used": self.vllm_doc_batch_size or len(doc_rows),
+                    "vllm_doc_batch_size_used": self.doc_batch_size or len(doc_rows),
                     "timing": agg_timing,
                 },
             }
-
         return results, batch_generate_total_t
 
-    def _run_vllm_batched_strategy(
-        self,
-        doc_rows: List[Dict[str, Any]],
-    ) -> Tuple[Dict[int, Dict[str, Any]], float]:
+    def _run_vllm_batched_strategy(self, doc_rows: List[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], float]:
         if self.strategy == "baseline":
             return self._run_vllm_batched_baseline_strategy(doc_rows)
         if self.strategy == "chunked":
@@ -1491,29 +1250,22 @@ class PatentExtractor:
             return self._run_vllm_batched_self_consistency_strategy(doc_rows)
         raise ValueError(f"Unknown strategy: {self.strategy}")
 
-    def _batch_extract_vllm(
-        self,
-        txt_dir: Path,
-        out_file: Path,
-        limit: Optional[int] = None,
-        raw_output_dir: Optional[Path] = None,
-    ) -> int:
+    def _batch_extract_vllm(self, txt_dir: Path, out_file: Path, limit: Optional[int] = None, raw_output_dir: Optional[Path] = None) -> int:
         txt_files = sorted(txt_dir.glob("*.txt"))
         total = len(txt_files)
-
         if limit is not None and limit < total:
             txt_files = txt_files[:limit]
             print(
                 f"⚙️ Limitation vLLM à {limit} documents (sur {total} total)"
                 f" | strategy={self.strategy}"
-                f" | micro_batch={self.vllm_doc_batch_size or 'all'}"
+                f" | micro_batch={self.doc_batch_size or 'all'}"
             )
         else:
             print(
                 f"⚙️ Traitement vLLM de {len(txt_files)} documents"
                 f" | strategy={self.strategy}"
-                f" | micro_batch={self.vllm_doc_batch_size or 'all'}"
-                f" | sort_by_prompt_len={'yes' if self.vllm_sort_by_prompt_length else 'no'}"
+                f" | micro_batch={self.doc_batch_size or 'all'}"
+                f" | sort_by_prompt_len={'yes' if self.sort_by_prompt_length else 'no'}"
             )
 
         out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1525,7 +1277,7 @@ class PatentExtractor:
         doc_rows_by_index = {int(doc_row["original_index"]): doc_row for doc_row in doc_rows}
         strategy_results, batch_generate_total_t = self._run_vllm_batched_strategy(doc_rows)
 
-        with open(out_file, "w", encoding="utf-8") as f_out:
+        with out_file.open("w", encoding="utf-8") as f_out:
             count = 0
             for index in range(len(txt_files)):
                 record = records_by_index.get(index)
@@ -1564,16 +1316,151 @@ class PatentExtractor:
         print(f"📊 Résultats: {out_file}")
         return count
 
-    def _batch_extract_vllm_baseline(
-        self,
-        txt_dir: Path,
-        out_file: Path,
-        limit: Optional[int] = None,
-        raw_output_dir: Optional[Path] = None,
-    ) -> int:
-        return self._batch_extract_vllm(
-            txt_dir=txt_dir,
-            out_file=out_file,
-            limit=limit,
-            raw_output_dir=raw_output_dir,
+
+class PatentExtractionRunner:
+    """Public runner façade for the standalone vLLM-only package."""
+
+    def __init__(self, profile: ProfileConfig):
+        self.profile = profile
+        self._prompt_text: Optional[str] = None
+        self._extractor: Optional[PatentExtractor] = None
+
+    @classmethod
+    def from_profile(
+        cls,
+        *,
+        name: str = DEFAULT_PROFILE_NAME,
+        profile_path: Optional[str | Path] = None,
+        prompt_path: Optional[str | Path] = None,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> "PatentExtractionRunner":
+        profile = load_profile(
+            name=name,
+            profile_path=profile_path,
+            prompt_path=prompt_path,
+            overrides=overrides,
         )
+        return cls(profile=profile)
+
+    @property
+    def prompt_text(self) -> Optional[str]:
+        if self._prompt_text is None:
+            self._prompt_text = self.profile.read_prompt_text()
+        return self._prompt_text
+
+    def build_extractor(self) -> PatentExtractor:
+        if self._extractor is None:
+            extraction = self.profile.extraction
+            self._extractor = PatentExtractor(
+                model_name=extraction.model_name,
+                torch_dtype=extraction.torch_dtype,
+                quantization=extraction.vllm.quantization,
+                prompt_id=extraction.prompt_id,
+                prompt_template=self.prompt_text,
+                guardrail_profile=extraction.guardrail_profile,
+                max_ocr_chars=extraction.max_ocr_chars,
+                max_new_tokens=extraction.max_new_tokens,
+                temperature=extraction.temperature,
+                do_sample=extraction.do_sample,
+                extraction_mode=extraction.strategy.extraction_mode,
+                chunk_size_chars=extraction.strategy.chunk_size_chars,
+                chunk_overlap_chars=extraction.strategy.chunk_overlap_chars,
+                extraction_passes=extraction.strategy.extraction_passes,
+                strategy=extraction.strategy.name,
+                header_lines=extraction.strategy.header_lines,
+                targeted_rerun_threshold=extraction.strategy.targeted_rerun_threshold,
+                self_consistency_n=extraction.strategy.self_consistency_n,
+                self_consistency_temp=extraction.strategy.self_consistency_temp,
+                merge_policy=extraction.strategy.merge_policy,
+                save_strategy_meta=extraction.save_strategy_meta,
+                save_raw_output=extraction.save_raw_output,
+                timings=extraction.timings,
+                enable_prefix_caching=extraction.vllm.enable_prefix_caching,
+                tensor_parallel_size=extraction.vllm.tensor_parallel_size,
+                gpu_memory_utilization=extraction.vllm.gpu_memory_utilization,
+                max_model_len=extraction.vllm.max_model_len,
+                swap_space=extraction.vllm.swap_space,
+                enforce_eager=extraction.vllm.enforce_eager,
+                doc_batch_size=extraction.vllm.doc_batch_size,
+                sort_by_prompt_length=extraction.vllm.sort_by_prompt_length,
+                tokenizer_mode=extraction.vllm.tokenizer_mode,
+            )
+        return self._extractor
+
+    def extract(self, ocr_text: str, *, debug: bool = False):
+        return self.build_extractor().extract(ocr_text, debug=debug)
+
+    def extract_file(self, txt_path: str | Path, *, raw_output_dir: Optional[str | Path] = None):
+        raw_dir = Path(raw_output_dir) if raw_output_dir is not None else None
+        return self.build_extractor().extract_from_file(Path(txt_path), raw_output_dir=raw_dir)
+
+    def batch_extract(
+        self,
+        *,
+        texts_dir: str | Path,
+        out_root: str | Path,
+        run_name: str,
+        limit: Optional[int] = None,
+        force: bool = False,
+    ) -> RunArtifacts:
+        texts_path = Path(texts_dir)
+        if not texts_path.exists():
+            raise FileNotFoundError(f"Missing texts dir: {texts_path}")
+        if not texts_path.is_dir():
+            raise NotADirectoryError(f"texts_dir must be a directory: {texts_path}")
+
+        out_root_path = Path(out_root)
+        run_dir = out_root_path / run_name
+        preds_path = run_dir / "preds.jsonl"
+        run_meta_path = run_dir / "run.json"
+        raw_outputs_dir = run_dir / "raw_outputs" if self.profile.extraction.save_raw_output else None
+
+        if run_dir.exists() and not force:
+            raise FileExistsError(f"Run dir already exists: {run_dir}. Pass force=True to overwrite outputs.")
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        txt_files = sorted(texts_path.glob("*.txt"))
+        started_at = datetime.now(timezone.utc)
+        t0 = time.perf_counter()
+        docs_written = self.build_extractor().batch_extract(
+            txt_dir=texts_path,
+            out_file=preds_path,
+            limit=limit,
+            raw_output_dir=raw_outputs_dir,
+        )
+        wall_s = max(0.0, time.perf_counter() - t0)
+        finished_at = datetime.now(timezone.utc)
+
+        prompt_text = self.prompt_text or ""
+        run_meta = {
+            "runner": "patent_extraction",
+            "profile_name": self.profile.name,
+            "profile_path": str(self.profile.definition_path) if self.profile.definition_path is not None else None,
+            "description": self.profile.description,
+            "texts_dir": str(texts_path),
+            "run_name": run_name,
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "wall_s": round(wall_s, 6),
+            "docs_total": len(txt_files),
+            "docs_limit": limit,
+            "docs_written": docs_written,
+            "preds_path": str(preds_path),
+            "raw_outputs_dir": str(raw_outputs_dir) if raw_outputs_dir is not None else None,
+            "prompt_path": str(self.profile.extraction.prompt_path) if self.profile.extraction.prompt_path else None,
+            "prompt_hash": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest() if prompt_text else None,
+            "config": _jsonable(self.profile.extraction.as_dict()),
+        }
+        run_meta_path.write_text(json.dumps(run_meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        return RunArtifacts(
+            run_dir=run_dir,
+            preds_path=preds_path,
+            run_meta_path=run_meta_path,
+            raw_outputs_dir=raw_outputs_dir,
+            docs_written=docs_written,
+            wall_s=wall_s,
+        )
+
+
+__all__ = ["PatentExtractionRunner", "PatentExtractor", "RunArtifacts", "_PROMPT_BY_ID"]

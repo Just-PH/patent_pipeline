@@ -49,6 +49,7 @@ def _default_backend_spec(backend_key: str) -> str:
         "gotocr": "patent_pipeline.patent_ocr.backends.got_ocr_backend:GotOcrBackend",
         "paddle": "patent_pipeline.patent_ocr.backends.paddleocr_backend:PaddleOcrBackend",
         "lightonocr": "patent_pipeline.patent_ocr.backends.lightonocr_backend:LightOnOcrBackend",
+        "glmocr_vllm": "patent_pipeline.patent_ocr.backends.glm_ocr_vllm_backend:GlmOcrVllmBackend",
     }
     if backend_key not in m:
         raise ValueError(

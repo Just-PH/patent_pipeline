@@ -245,6 +245,9 @@ docker run --rm --gpus all --ipc=host \
     --force
 ```
 
+Known runtime note:
+- if vLLM crashes during `Capturing CUDA graphs` with `CUDA error: operation not permitted`, see [docs/troubleshooting.md](./docs/troubleshooting.md) and retry with `VLLM_ENFORCE_EAGER=1`
+
 Static smoke on the VM:
 
 ```bash

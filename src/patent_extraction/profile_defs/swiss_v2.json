@@ -1,0 +1,40 @@
+{
+  "name": "swiss_v2",
+  "description": "Swiss multilingual patent extraction (DE/FR/IT), strict date/assignee guardrails, compact post-text reminder.",
+  "prompt_resource": "swiss_v2.txt",
+  "extraction": {
+    "model_name": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+    "backend": "vllm",
+    "guardrail_profile": "de_legacy_self_applicant",
+    "max_ocr_chars": 10000,
+    "max_new_tokens": 1024,
+    "temperature": 0.0,
+    "do_sample": false,
+    "save_strategy_meta": true,
+    "save_raw_output": false,
+    "timings": "basic"
+  },
+  "vllm": {
+    "enable_prefix_caching": true,
+    "tensor_parallel_size": 1,
+    "gpu_memory_utilization": 0.9,
+    "max_model_len": 8192,
+    "swap_space": 0.0,
+    "enforce_eager": false,
+    "doc_batch_size": null,
+    "sort_by_prompt_length": true,
+    "tokenizer_mode": "auto"
+  },
+  "strategy": {
+    "name": "two_pass_targeted",
+    "extraction_mode": "auto",
+    "chunk_size_chars": 7000,
+    "chunk_overlap_chars": 800,
+    "extraction_passes": 2,
+    "header_lines": 30,
+    "targeted_rerun_threshold": 0.6,
+    "self_consistency_n": 2,
+    "self_consistency_temp": 0.2,
+    "merge_policy": "prefer_non_null"
+  }
+}

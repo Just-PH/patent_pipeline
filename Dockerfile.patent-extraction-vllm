@@ -1,0 +1,45 @@
+FROM vllm/vllm-openai:v0.11.0
+
+ARG HF_MODEL=mistralai/Mistral-Small-3.1-24B-Instruct-2503
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    HF_HOME=/data/cache/huggingface \
+    HF_HUB_CACHE=/data/cache/huggingface \
+    TORCH_HOME=/data/cache/torch \
+    HF_MODEL=${HF_MODEL} \
+    TOKENIZERS_PARALLELISM=false
+
+USER root
+WORKDIR /app
+
+RUN mkdir -p /data/cache/huggingface /data/cache/torch
+
+RUN if ! command -v python >/dev/null 2>&1; then \
+      ln -sf "$(command -v python3)" /usr/local/bin/python; \
+    fi
+
+COPY requirements.patent-extraction-vllm.txt /tmp/requirements.patent-extraction-vllm.txt
+RUN python3 -m pip install --no-cache-dir -U pip setuptools wheel && \
+    python3 -m pip install --no-cache-dir -r /tmp/requirements.patent-extraction-vllm.txt && \
+    rm -f /tmp/requirements.patent-extraction-vllm.txt
+
+COPY src/patent_extraction /app/src/patent_extraction
+COPY scripts/run_patent_extraction.py /app/scripts/run_patent_extraction.py
+
+RUN python3 - <<'PY'
+import importlib.util
+import vllm
+from patent_extraction.extractor import PatentExtractor, PatentExtractionRunner
+
+print("vllm:", vllm.__version__)
+print("bitsandbytes_installed:", importlib.util.find_spec("bitsandbytes") is not None)
+print("extractor_import_ok:", PatentExtractor.__name__)
+print("runner_import_ok:", PatentExtractionRunner.__name__)
+PY
+
+ENTRYPOINT []
+CMD ["bash"]

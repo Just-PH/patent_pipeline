@@ -1,4 +1,4 @@
-FROM vllm/vllm-openai:v0.11.0
+FROM vllm/vllm-openai:nightly
 
 ARG HF_MODEL=mistralai/Mistral-Small-3.1-24B-Instruct-2503
 
@@ -18,6 +18,9 @@ WORKDIR /app
 
 RUN mkdir -p /data/cache/huggingface /data/cache/torch
 
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN if ! command -v python >/dev/null 2>&1; then \
       ln -sf "$(command -v python3)" /usr/local/bin/python; \
     fi
@@ -25,6 +28,7 @@ RUN if ! command -v python >/dev/null 2>&1; then \
 COPY requirements.slm-mistral31-vllm.txt /tmp/requirements.slm-mistral31-vllm.txt
 RUN python3 -m pip install --no-cache-dir -U pip setuptools wheel && \
     python3 -m pip install --no-cache-dir -r /tmp/requirements.slm-mistral31-vllm.txt && \
+    python3 -m pip install --no-cache-dir "git+https://github.com/huggingface/transformers.git" && \
     rm -f /tmp/requirements.slm-mistral31-vllm.txt
 
 COPY src /app/src
@@ -32,6 +36,7 @@ COPY scripts /app/scripts
 
 RUN python3 - <<'PY'
 import importlib.util
+import importlib
 import torch
 import transformers
 import vllm
@@ -40,6 +45,7 @@ from patent_pipeline.pydantic_extraction.patent_extractor import PatentExtractor
 print("torch:", torch.__version__)
 print("transformers:", transformers.__version__)
 print("vllm:", vllm.__version__)
+print("glm_ocr_transformers_module:", importlib.import_module("transformers.models.glm_ocr").__name__)
 print("bitsandbytes_installed:", importlib.util.find_spec("bitsandbytes") is not None)
 print("extractor_import_ok:", PatentExtractor.__name__)
 PY

@@ -36,7 +36,10 @@ dependencies = [
 ]
 
 [tool.poetry]
-packages = [{ include = "patent_pipeline", from = "src" }]
+packages = [
+    { include = "patent_pipeline", from = "src" },
+    { include = "patent_extraction", from = "src" },
+]
 
 # ========== OPTIONAL GROUPS ==========
 

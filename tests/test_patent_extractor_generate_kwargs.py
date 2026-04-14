@@ -206,6 +206,20 @@ class TestPatentExtractorGenerateKwargs(unittest.TestCase):
         self.assertEqual(seen["sampling_params"], "sampling")
         self.assertFalse(seen["use_tqdm"])
 
+    def test_render_prompt_template_supports_raw_and_escaped_json_braces(self):
+        raw_template = 'Example:\n{"title": null}\nText:\n{text}'
+        escaped_template = 'Example:\n{{"title": null}}\nText:\n{text}'
+
+        raw_rendered = pe.PatentExtractor._render_prompt_template(raw_template, "hello")
+        escaped_rendered = pe.PatentExtractor._render_prompt_template(escaped_template, "hello")
+
+        self.assertIn('{"title": null}', raw_rendered)
+        self.assertIn('{"title": null}', escaped_rendered)
+        self.assertIn("hello", raw_rendered)
+        self.assertIn("hello", escaped_rendered)
+        self.assertNotIn('{{"title"', raw_rendered)
+        self.assertNotIn('{{"title"', escaped_rendered)
+
     def test_prompt_v3_drops_self_assignee_for_old_german_self_applicant_pattern(self):
         metadata = pe.PatentMetadata(
             title="Drehkolbenmaschine",

@@ -28,7 +28,7 @@ def main():
         "--backend",
         type=str,
         default="doctr",
-        choices=["tesseract", "tesserocr", "doctr", "gotocr", "paddle", "lightonocr"],
+        choices=["tesseract", "tesserocr", "doctr", "gotocr", "paddle", "lightonocr", "glmocr_vllm"],
         help="OCR backend key",
     )
     parser.add_argument("--backend_import", type=str, default=None, help="Override backend import path module:Class")

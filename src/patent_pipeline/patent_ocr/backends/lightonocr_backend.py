@@ -220,6 +220,7 @@ class LightOnOcrBackend:
             conversations,
             add_generation_prompt=True,
             tokenize=True,
+            padding=True,
             return_dict=True,
             return_tensors="pt",
         )
